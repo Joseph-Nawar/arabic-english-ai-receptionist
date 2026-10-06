@@ -23,7 +23,7 @@
 - Work only on the requested phase branch and keep commits reviewable and scoped.
 - Do not use destructive Git commands such as `reset --hard`, force-push, or history rewriting.
 - Codex cannot merge branches, create/merge PRs, or mark milestones `COMPLETE`.
-- Phase 0 must end as `REVIEW` pending independent human review.
+- Codex implementation milestones may end at `REVIEW`, but Codex must never mark a milestone `COMPLETE`. `COMPLETE` requires independent human or senior review.
 
 ## Required closeout report
 

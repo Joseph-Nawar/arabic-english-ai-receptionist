@@ -5,12 +5,12 @@ The reproducible local loop uses host Python/uv for FastAPI and Docker Compose o
 ## Fresh clone
 
 1. Install Python `3.12.15`, uv `0.12.22` or another version in the project-supported range `>=0.12.22,<0.13`, Docker, and Docker Compose.
-2. Clone the repository and switch to the requested branch:
+2. Clone the repository. The normal development branch is `main`:
 
    ```sh
    git clone https://github.com/Joseph-Nawar/arabic-english-ai-receptionist.git
    cd arabic-english-ai-receptionist
-   git switch phase/0-foundation
+   git switch main
    ```
 
 3. Confirm the tool versions:

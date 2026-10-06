@@ -8,12 +8,16 @@ The project is a configurable template for one business at a time: a portfolio d
 
 The system is a modular monolith. FastAPI is the process boundary, PostgreSQL is the durable system of record, and the Python modules are organized by responsibility rather than by speculative future packages. Phase 0 contains only application configuration, standard-library logging, database resources/metadata, Alembic wiring, and health routes.
 
-Authority is explicit:
+Authority is explicit and follows this hierarchy:
 
-- application code owns request coordination, configuration validation, and lifecycle side effects;
-- PostgreSQL owns durable application state once later phases add real schema;
-- integrations own communication with their external systems and do not become alternate sources of truth;
-- asynchronous work, when later required, must be introduced only with a concrete use case and a documented owner.
+- business configuration is authoritative for configured services, prices or pricing wording, service areas, opening hours, and business rules/policies;
+- Google Calendar or the selected booking provider is authoritative for actual live appointment availability and external calendar event state;
+- HubSpot CRM is authoritative for CRM customer, lead, and opportunity lifecycle state;
+- PostgreSQL is authoritative for this application's internal operational state, including local identity mapping, conversations, handoff state, tool and audit records, idempotency records, and local workflow state;
+- application policy is authoritative for whether an operation is permitted, validated, confirmed, and safe to execute;
+- the LLM is authoritative for none of the above; it performs language understanding, bounded tool selection, and response generation.
+
+Application code owns request coordination, configuration validation, and lifecycle side effects. Asynchronous work, when later required, must be introduced only with a concrete use case and a documented owner.
 
 ## PostgreSQL responsibility
 
@@ -25,7 +29,7 @@ Realtime request/response work should remain in the web process when a user is w
 
 ## Future channels and integrations
 
-Future channels may include web/operator interactions, messaging/WhatsApp, voice/voice notes, and provider webhooks. Calendar, CRM, LLM, and other external services remain explicit integration boundaries; their responsibilities and ownership rules are documented in `integration-boundaries.md`. No provider SDK or integration interface is present in Phase 0.
+Future channels may include web/operator interactions, messaging/WhatsApp, voice/voice notes, and provider webhooks. These channel and media integrations primarily transport messages, audio, and provider lifecycle events. Calendar and CRM integrations are different: they own specific authoritative state in their external systems, while the application remains authoritative for policy and its local operational record. Their responsibilities and ownership rules are documented in `integration-boundaries.md`. No provider SDK or integration interface is present in Phase 0.
 
 ## Future operator UI
 
