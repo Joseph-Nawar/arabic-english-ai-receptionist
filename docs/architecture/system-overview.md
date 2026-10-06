@@ -6,7 +6,7 @@ The project is a configurable template for one business at a time: a portfolio d
 
 ## Core architecture
 
-The system is a modular monolith. FastAPI is the process boundary, PostgreSQL is the durable system of record, and the Python modules are organized by responsibility rather than by speculative future packages. Phase 0 contains only application configuration, standard-library logging, database resources/metadata, Alembic wiring, and health routes.
+The system is a modular monolith. FastAPI is the process boundary, and PostgreSQL is the durable store for this application's internal operational state; external systems retain the authoritative state explicitly assigned to them below. The Python modules are organized by responsibility rather than by speculative future packages. Phase 0 contains only application configuration, standard-library logging, database resources/metadata, Alembic wiring, and health routes.
 
 Authority is explicit and follows this hierarchy:
 
