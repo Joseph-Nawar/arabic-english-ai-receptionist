@@ -33,6 +33,9 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/receptionist"]
 
+[tool.uv]
+required-version = ">=0.12.22,<0.13"
+
 [tool.pytest.ini_options]
 testpaths = ["tests/unit", "tests/integration"]
 addopts = ["--strict-config", "--strict-markers", "--cov=receptionist", "--cov-report=term-missing", "-ra"]

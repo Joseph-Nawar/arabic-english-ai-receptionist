@@ -4,7 +4,7 @@ The reproducible local loop uses host Python/uv for FastAPI and Docker Compose o
 
 ## Fresh clone
 
-1. Install Python `3.12.15`, uv `0.12.2`, Docker, and Docker Compose.
+1. Install Python `3.12.15`, uv `0.12.22` or another version in the project-supported range `>=0.12.22,<0.13`, Docker, and Docker Compose.
 2. Clone the repository and switch to the requested branch:
 
    ```sh

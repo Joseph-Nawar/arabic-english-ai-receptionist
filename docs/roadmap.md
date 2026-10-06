@@ -4,7 +4,7 @@ This is the approved 13-phase roadmap for the Arabic-English AI Receptionist & C
 
 | Phase | Scope | Status |
 | --- | --- | --- |
-| 0 | Engineering Foundation & Architecture | `REVIEW` |
+| 0 | Engineering Foundation & Architecture | `FIX REQUIRED` |
 | 1 | Core Domain Model & Business Configuration | `NOT STARTED` |
 | 2 | Identity, Service Area & Operating Rules | `NOT STARTED` |
 | 3 | Conversations, Turns & Audit Trail | `NOT STARTED` |
