@@ -53,7 +53,8 @@ class Settings(BaseSettings):
 
 def get_settings() -> Settings:
     """Load settings from the process environment for the default ASGI app."""
-    return Settings()
+    # pydantic-settings fills this required field from the process environment or .env.
+    return Settings()  # type: ignore[call-arg]
 
 
 def assert_safe_test_database(settings: Settings) -> None:
