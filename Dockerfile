@@ -1,5 +1,5 @@
-FROM ghcr.io/astral-sh/uv:0.12.2 AS uv
-FROM python:3.12.15-slim-bookworm
+FROM ghcr.io/astral-sh/uv:0.12.2@sha256:069a51314a7bb6031777a9273205fe1b0b19e914ef418207d1338b268df641dd AS uv
+FROM python:3.12.15-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -26,4 +26,3 @@ USER appuser
 EXPOSE 8000
 
 CMD ["uv", "run", "--no-dev", "uvicorn", "receptionist.main:app", "--host", "0.0.0.0", "--port", "8000"]
-
