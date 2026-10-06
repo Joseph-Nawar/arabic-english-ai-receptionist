@@ -19,7 +19,7 @@ This document is conceptual in Phase 0. It defines future responsibilities and o
 - HubSpot CRM is authoritative for CRM customer, lead, and opportunity lifecycle state; it does not decide appointment availability.
 - PostgreSQL is authoritative for local identity mapping, conversations, handoff state, tool and audit records, idempotency records, and local workflow state.
 - The LLM is authoritative for none of these concerns. It may perform language understanding, bounded tool selection, and response generation, but it cannot bypass application authorization or validation.
-- Application-level idempotency protects side effects. Provider integrations later translate that protection into provider-specific idempotency and retry semantics.
+- Application-level idempotency protects side effects. Provider adapters, when a real integration exists, later translate that protection into provider-specific idempotency and retry semantics.
 
 ## Future responsibilities
 
