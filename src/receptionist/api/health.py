@@ -24,4 +24,3 @@ async def readiness(request: Request) -> JSONResponse:
     if await check_database(engine):
         return JSONResponse({"status": "ready"})
     return JSONResponse({"status": "unavailable"}, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
-

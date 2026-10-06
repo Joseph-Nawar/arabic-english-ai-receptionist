@@ -53,4 +53,3 @@ async def check_database(engine: AsyncEngine) -> bool:
 async def dispose_database(resources: DatabaseResources) -> None:
     """Dispose all pooled database connections during process shutdown."""
     await resources.engine.dispose()
-
