@@ -9,4 +9,4 @@ Phase 0 engineering foundation for a production-style portfolio project. The cur
 
 Only `/health/live` and `/health/ready` exist today. Customer operations, AI behavior, messaging, WhatsApp, voice, booking, CRM, and operator UI features are future phases and are not implemented.
 
-Start with [the local setup guide](docs/development/setup.md), read [the canonical roadmap](docs/roadmap.md), and review [the architecture](docs/architecture/system-overview.md). Phase 0 is intentionally `REVIEW`, not `COMPLETE`.
+Start with [the local setup guide](docs/development/setup.md), read [the canonical roadmap](docs/roadmap.md), and review [the architecture](docs/architecture/system-overview.md). Phase 0 is complete following independent review and approval; later customer-operations, AI, messaging, booking, CRM, and operator UI functionality remains future work.
