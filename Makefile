@@ -4,7 +4,7 @@ TEST_DATABASE_URL ?= postgresql+psycopg://receptionist:receptionist@localhost:55
 
 .PHONY: install dev db-up db-down test-db-up test-db-down migrate test test-unit \
 	test-integration lint format format-check typecheck secrets audit security \
-	docker-config docker-build check verify
+	alembic-verify docker-config docker-build check verify
 
 install:
 	$(UV) sync --all-groups --frozen
@@ -36,6 +36,9 @@ test-unit:
 test-integration:
 	RECEPTIONIST_APP_ENV=test RECEPTIONIST_DATABASE_URL="$(TEST_DATABASE_URL)" $(UV) run pytest -m integration tests/integration
 
+alembic-verify:
+	RECEPTIONIST_APP_ENV=test RECEPTIONIST_DATABASE_URL="$(TEST_DATABASE_URL)" $(UV) run python -c 'from alembic import command; from alembic.config import Config; from receptionist.core.config import Settings, assert_safe_test_database; settings = Settings(_env_file=None); assert_safe_test_database(settings); config = Config("alembic.ini"); command.upgrade(config, "head"); command.downgrade(config, "base"); command.upgrade(config, "head")'
+
 lint:
 	$(UV) run ruff check .
 
@@ -64,5 +67,4 @@ docker-build:
 
 check: format-check lint typecheck secrets audit test-unit
 
-verify: check test-integration docker-config docker-build
-
+verify: check test-integration alembic-verify docker-config docker-build

@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:18.6-bookworm
+    environment:
+      POSTGRES_DB: receptionist
+      POSTGRES_USER: receptionist
+      POSTGRES_PASSWORD: receptionist
+    ports:
+      - "5432:5432"
+    volumes:
+      - receptionist_postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U receptionist -d receptionist"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  test-db:
+    profiles: ["test"]
+    image: postgres:18.6-bookworm
+    environment:
+      POSTGRES_DB: receptionist_test
+      POSTGRES_USER: receptionist
+      POSTGRES_PASSWORD: receptionist
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U receptionist -d receptionist_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  receptionist_postgres_data:
+
