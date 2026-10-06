@@ -43,4 +43,3 @@ make verify
 ```
 
 These run Ruff lint/format checks, strict mypy for `src/`, the blocking detect-secrets hook, pip-audit, tests, integration/Alembic verification, Compose validation, and the Docker build. Secret scanning includes tracked and untracked non-ignored working-tree files locally.
-

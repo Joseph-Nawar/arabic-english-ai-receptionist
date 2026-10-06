@@ -36,4 +36,3 @@ Own model client configuration, prompt/tool transport, provider response parsing
 ### Asynchronous events
 
 Own delivery mechanics, retry/backoff, deduplication, and observability only when a concrete asynchronous workload exists. The application/database owns event meaning, state transitions, and idempotency keys. A queue or event bus is not part of Phase 0.
-

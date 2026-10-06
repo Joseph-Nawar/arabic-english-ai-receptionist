@@ -110,4 +110,3 @@
 - [ ] Perform the database-down liveness/readiness/recovery check without restarting FastAPI.
 - [ ] Inspect the final diff against the starting SHA for residue, secrets, speculative code, and scope violations.
 - [ ] Commit only any necessary verification-driven fixes, then report Phase 0 as `REVIEW` pending independent human approval.
-

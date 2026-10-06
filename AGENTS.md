@@ -43,4 +43,3 @@ Close implementation work with exactly these sections:
 12. Scope audit
 
 Include exact commands/results, starting and ending SHAs, branch/working-tree state, deviations, unresolved limitations, security findings, and confirmation that no future-phase functionality was added.
-

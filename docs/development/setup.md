@@ -50,4 +50,3 @@ The reproducible local loop uses host Python/uv for FastAPI and Docker Compose o
    ```
 
 The application does not run migrations automatically at startup. Stop infrastructure with `make db-down` when finished. The isolated test database uses `make test-db-up`, port `55432`, and database name `receptionist_test`; use `make test-db-down` to stop it.
-

@@ -38,4 +38,3 @@ The default Phase 10 decision is server-rendered FastAPI/Jinja2 pages with minim
 - no external provider SDKs or live SaaS calls;
 - no queues, background workers, event bus, Redis, Kubernetes, Terraform, or observability platform;
 - no speculative adapters, Protocols, repositories, unit-of-work layer, registries, or provider packages.
-

@@ -78,4 +78,3 @@ jobs:
 
       - name: Build backend image
         run: docker build -t arabic-english-ai-receptionist:ci .
-
