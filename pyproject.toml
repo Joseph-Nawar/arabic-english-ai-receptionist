@@ -35,7 +35,7 @@ packages = ["src/receptionist"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/unit", "tests/integration"]
-addopts = ["--strict-config", "--strict-markers", "-ra"]
+addopts = ["--strict-config", "--strict-markers", "--cov=receptionist", "--cov-report=term-missing", "-ra"]
 asyncio_mode = "auto"
 markers = [
     "unit: tests that do not require PostgreSQL, Docker, network access, or external providers",
@@ -57,4 +57,3 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4", "DTZ", "S", "RUF"]
 python_version = "3.12"
 strict = true
 files = ["src"]
-

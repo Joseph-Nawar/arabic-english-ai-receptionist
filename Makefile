@@ -16,19 +16,21 @@ db-up:
 	docker compose up -d db
 
 db-down:
-	docker compose down
+	docker compose stop db
+	docker compose rm -f db
 
 test-db-up:
 	docker compose --profile test up -d test-db
 
 test-db-down:
-	docker compose --profile test down
+	docker compose --profile test stop test-db
+	docker compose --profile test rm -f test-db
 
 migrate:
 	RECEPTIONIST_APP_ENV=local RECEPTIONIST_DATABASE_URL="$(DATABASE_URL)" $(UV) run alembic upgrade head
 
 test:
-	$(UV) run pytest
+	RECEPTIONIST_APP_ENV=test RECEPTIONIST_DATABASE_URL="$(TEST_DATABASE_URL)" $(UV) run pytest
 
 test-unit:
 	$(UV) run pytest -m unit tests/unit

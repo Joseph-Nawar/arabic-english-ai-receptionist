@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -52,7 +53,7 @@ def test_invalid_environment_or_log_level_is_rejected(field: str, value: str) ->
 
 
 def test_settings_tests_ignore_dotenv_and_ambient_environment(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(
