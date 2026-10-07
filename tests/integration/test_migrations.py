@@ -61,7 +61,9 @@ def test_alembic_upgrade_downgrade_upgrade_cycle(integration_settings, monkeypat
             ).scalar_one()
             assert version == head
             assert set(inspect(connection).get_table_names()) >= EXPECTED_TABLES
-            booking_columns = {column["name"] for column in inspect(connection).get_columns("booking")}
+            booking_columns = {
+                column["name"] for column in inspect(connection).get_columns("booking")
+            }
             assert {"calendar_id", "calendar_event_id"} <= booking_columns
             booking_indexes = inspect(connection).get_indexes("booking")
             assert any(
@@ -71,7 +73,8 @@ def test_alembic_upgrade_downgrade_upgrade_cycle(integration_settings, monkeypat
                 for index in booking_indexes
             )
             booking_checks = {
-                constraint["name"] for constraint in inspect(connection).get_check_constraints("booking")
+                constraint["name"]
+                for constraint in inspect(connection).get_check_constraints("booking")
             }
             assert {
                 "ck_booking_calendar_reference_pair",

@@ -66,10 +66,7 @@ class Settings(BaseSettings):
         )
         return all(
             value is not None
-            and (
-                not isinstance(value, SecretStr)
-                or bool(value.get_secret_value().strip())
-            )
+            and (not isinstance(value, SecretStr) or bool(value.get_secret_value().strip()))
             and (not isinstance(value, str) or bool(value.strip()))
             for value in required_values
         )

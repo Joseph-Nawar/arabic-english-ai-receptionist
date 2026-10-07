@@ -5,6 +5,8 @@ from uuid import uuid4
 
 import pytest
 
+from receptionist.application.booking import check_calendar_availability
+from receptionist.domain.booking_policy import PolicyDecision, RequestedInterval
 from receptionist.integrations.google_calendar import (
     CalendarBusyInterval,
     CalendarClientError,
@@ -13,8 +15,6 @@ from receptionist.integrations.google_calendar import (
     CalendarEventPatch,
     CalendarInterval,
 )
-from receptionist.application.booking import check_calendar_availability
-from receptionist.domain.booking_policy import PolicyDecision, RequestedInterval
 from tests.support.calendar_double import DeterministicCalendarDouble
 
 pytestmark = pytest.mark.unit
