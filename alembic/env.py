@@ -1,4 +1,4 @@
-"""Alembic environment wired to application settings and empty metadata."""
+"""Alembic environment wired to application settings and domain metadata."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
 from receptionist.core.config import get_settings
+from receptionist.db import models as _models  # noqa: F401
 from receptionist.db.base import Base
 
 config = context.config
