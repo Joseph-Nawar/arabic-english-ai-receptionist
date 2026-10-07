@@ -299,7 +299,8 @@ Do not modify the approved `docs/architecture/domain-model.md` during implementa
 - [ ] Different phones resolve to different Contacts.
 - [ ] Repeated same-phone resolution is idempotent.
 - [ ] Two unknown/withheld resolutions create distinct Contacts.
-- [ ] Two independent sessions resolving the same phone converge to one Contact using `asyncio.gather` and transaction completion, with no sleeps.
+- [ ] The concurrent same-phone test runs two worker coroutines with `asyncio.gather`; each worker creates/uses its own independent `AsyncSession`, owns an outer transaction, calls `resolve_or_create_contact` inside it, commits/exits that transaction before the worker coroutine completes, and returns the resolved Contact ID. Use no arbitrary sleeps or application/advisory locks; wrap the gather in a bounded timeout so a lock/protocol error fails deterministically instead of hanging.
+- [ ] After both workers complete, assert both returned Contact IDs are identical, then independently query the database and assert exactly one Contact exists for the canonical non-null E.164 value.
 - [ ] Returned Contact queries remain within the resolved phone boundary; no name-based cross-contact behavior exists.
 
 **Acceptance criteria:**
@@ -428,7 +429,7 @@ Do not modify the approved `docs/architecture/domain-model.md` during implementa
 
 **Tests/verification first:**
 
-- [ ] Add shell-level verification notes/commands for empty `MSG` rejection, successful autogenerate invocation in a temporary branch state, guarded migration check, and refusal to target a non-test database for destructive checks.
+- [ ] Add verification notes/commands for empty `MSG` rejection, the supported Task-5 autogeneration path, guarded migration check, and refusal to target a non-test database for destructive checks; do not create a disposable revision solely to test this Make target.
 
 **Acceptance criteria:**
 - Empty migration messages are rejected.
@@ -510,6 +511,7 @@ Do not modify the approved `docs/architecture/domain-model.md` during implementa
 - Duplicate non-null ToolExecution idempotency key rejected; multiple NULL keys accepted.
 - Duplicate `(provider, external_event_id)` rejected; same external ID across providers accepted.
 - Direct invalid controlled-string values rejected by database check constraints.
+- The concurrent same-phone test uses two worker-owned independent sessions and outer transactions; each worker commits before returning, the coroutines run concurrently under a bounded timeout with no sleeps/locks, both IDs match, and an independent count query finds exactly one canonical Contact.
 - Reference seed creates one singleton and exactly four services; second run creates no duplicates.
 - Assertions for queries/identity operations do not cross Contact boundaries.
 
@@ -624,6 +626,18 @@ Do not modify the approved `docs/architecture/domain-model.md` during implementa
 - [ ] Start the isolated PostgreSQL service with `make test-db-up`.
 - [ ] Run `make migration-check` and `make test-integration` against the guarded test database.
 - [ ] Run the seed path in `test` or `ci` and confirm one singleton/four services; run it twice and confirm no duplicates.
+- [ ] Using a one-off local verification probe with explicit `AsyncSession` transactions, resolve a valid Saudi national-format phone with region `SA`.
+- [ ] Resolve an equivalent international/E.164 representation and prove it returns the same Contact ID.
+- [ ] Resolve a different valid phone and prove it returns a different Contact ID.
+- [ ] Resolve two missing/withheld callers and prove they create two different NULL-phone Contact IDs.
+- [ ] Create a Conversation for the first Contact, then create ConversationTurn sequence numbers `1` and `2`.
+- [ ] Stage a `create_booking` pending action, persist its fields on the Conversation, then confirm it and reload the row.
+- [ ] Exercise control transitions `AI -> HANDOFF_PENDING -> HUMAN -> AI` and verify the persisted final control mode.
+- [ ] Create and inspect a Handoff record with an approved status/reason/priority.
+- [ ] Create and reload a minimal provider-independent Booking with Contact/Service references and ordered UTC start/end values; verify there is no Calendar interaction or provider field.
+- [ ] Insert representative ToolExecution, AuditEvent, ProviderEventReceipt, and unpublished OutboxEvent rows; reload them from a new session and inspect their persisted values.
+- [ ] Deliberately attempt representative duplicate/invalid constraints (duplicate phone, duplicate turn sequence, second active handoff, duplicate tool idempotency key, duplicate provider/event pair, and invalid Booking time pairing) and confirm PostgreSQL rejects each with explicit rollback before continuing.
+- [ ] Close the probe session, open a new session, and re-query the Contact, Conversation, Turns, pending-action result, Handoff, Booking, ToolExecution, AuditEvent, ProviderEventReceipt, and OutboxEvent rows so verification relies on durable reload rather than in-memory ORM objects.
 - [ ] Run `RECEPTIONIST_APP_ENV=production RECEPTIONIST_DATABASE_URL="$TEST_DATABASE_URL" uv run python -m receptionist.seed` and confirm it fails closed before persistence.
 - [ ] Run `make alembic-verify` and the full quality/security gates.
 - [ ] Inspect ordinary logs/output for opaque IDs only and confirm no raw phone/email/conversation/payload/secret output was introduced.
@@ -641,7 +655,7 @@ Do not modify the approved `docs/architecture/domain-model.md` during implementa
 
 **Files:**
 - Modify: `docs/roadmap.md` only, changing Phase 1 from `IN PROGRESS` to `REVIEW` after all evidence passes.
-- Record: final closeout report in the response using the exact 12 required sections from `AGENTS.md`.
+- Record: final closeout report in the response using these distinct sections: `Status`, `Git`, `Files changed`, `Domain/schema implementation`, `Architectural decisions`, `Migration`, `Tests`, `Quality/tooling`, `Manual verification`, `Privacy/security`, `Scope audit`, `Deviations`, `Known limitations`, and `Cost`. Include any additional required information inside these sections rather than collapsing `Migration`, `Privacy/security`, or `Cost` into another section.
 
 **Audit checklist:**
 
@@ -656,5 +670,5 @@ Do not modify the approved `docs/architecture/domain-model.md` during implementa
 **Acceptance criteria:**
 - All required unit/integration/quality/security/manual checks have fresh evidence.
 - No unresolved implementation conflict or unexplained deviation remains.
-- The final report contains exactly: Status; Git; Files changed; Implementation summary; Architectural decisions; Tests executed; Quality/tooling results; Manual verification; Deviations; Known limitations; Security and cost; Scope audit.
+- The final report contains the required distinct sections: Status; Git; Files changed; Domain/schema implementation; Architectural decisions; Migration; Tests; Quality/tooling; Manual verification; Privacy/security; Scope audit; Deviations; Known limitations; Cost.
 - Phase 1 is a review candidate only.
