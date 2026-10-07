@@ -92,6 +92,7 @@ authorized-user refresh token.
 
 - Add only these direct dependencies, with these bounded ranges, and let uv resolve their transitive lockfile set: `google-api-python-client>=2.181,<3`, `google-auth>=2.40,<3`, and `google-auth-httplib2>=0.2,<1`. Do not add `google-auth-oauthlib`; consent/bootstrap is an operator task outside the application.
 - Use a runtime refresh token and client credentials; do not implement an OAuth web flow, credential file loader, local token writer, or consent route.
+- Freeze the authorized-user OAuth scope set to exactly `https://www.googleapis.com/auth/calendar.events` and `https://www.googleapis.com/auth/calendar.freebusy`. The out-of-band operator bootstrap grants both scopes; do not request the broader `https://www.googleapis.com/auth/calendar` scope, add an arbitrary-scope setting, or implement consent/escalation in the application.
 - Keep all Calendar settings optional for ordinary unit/integration/CI execution. The real client must fail with a safe configuration error when the required values are absent.
 - Keep Settings tests isolated with `_env_file=None`, explicit constructor values, and `monkeypatch` cleanup exactly as Phase 0 established. `.env.example` contains empty/placeholders only and no credential-like values.
 - Preserve `SecretStr(repr=False)` behavior and safe logging conventions.
@@ -103,6 +104,7 @@ authorized-user refresh token.
 - [ ] `test_google_calendar_secrets_are_absent_from_repr_and_logs` asserts client secret and refresh token values do not appear in `repr(settings)` or `log_configuration()` output.
 - [ ] `test_settings_tests_ignore_dotenv_and_ambient_google_configuration` creates a temporary `.env`, sets ambient Calendar variables, passes `_env_file=None`, and verifies explicit settings isolation.
 - [ ] `test_calendar_timeout_is_positive_and_bounded` rejects zero/negative/over-limit values.
+- [ ] Configuration/bootstrap documentation and the Google client tests use exactly the two approved scopes, with no broader or caller-supplied scope set.
 
 **Acceptance criteria:**
 
@@ -302,22 +304,29 @@ network calls.
   - `patch_event(calendar_id: str, event_id: str, owned_fields: CalendarEventPatch, if_match_etag: str) -> CalendarEventSnapshot`;
   - `cancel_event(calendar_id: str, event_id: str, if_match_etag: str) -> None`.
 - `GoogleCalendarClient.from_settings(settings: Settings) -> GoogleCalendarClient` validates configured runtime settings and constructs authorized HTTP with the explicit timeout.
+- The Google client constructs authorized-user credentials with exactly `https://www.googleapis.com/auth/calendar.events` and `https://www.googleapis.com/auth/calendar.freebusy`; scopes are a private constant, not a configuration option.
 - Provider-safe exceptions/models must expose only bounded application-owned error categories; raw response bodies, tokens, headers, and Google Event objects stay inside this module.
+- Missing or insufficient authorization, including a missing approved scope, maps to the bounded `calendar_unavailable`/approved authentication failure result without exposing provider details.
 
 **Behavior and constraints:**
 
 - Use `google-api-python-client`/`google-auth`/`google-auth-httplib2`, refresh-token credentials, `build("calendar", "v3", ...)`, and no consent flow.
 - Wrap the synchronous Google client calls in the existing async application boundary without blocking the event loop; use a bounded HTTP/request timeout and no unbounded retry loop.
-- `query_free_busy` translates RFC3339/UTC free/busy intervals.
-- `query_conflicts` uses event listing with the provider’s recurrence expansion, returns only bounded conflict records, excludes only the exact event ID, and filters cancelled/non-blocking transparent events.
+- `query_free_busy` calls `freebusy.query` for the configured Calendar and translates RFC3339/UTC free/busy intervals. It inspects the requested Calendar entry for embedded provider errors; any error, including an unknown future reason, maps to bounded `calendar_unavailable` behavior and never to free/available.
+- `query_conflicts` calls `events.list` with the configured Calendar ID, effective `timeMin`, effective `timeMax`, `singleEvents=True`, and `showDeleted=False`; follows `nextPageToken` until absent while repeating the same query parameters on every page; and collects all pages before deciding availability. It uses provider recurrence expansion, excludes only the exact event ID, and filters cancelled/non-blocking transparent events.
+- `query_conflicts` translates timed `dateTime` events to aware UTC intervals and opaque all-day `date` events to the half-open `[start.date, end.date)` interval in the valid Calendar/list response timezone. An opaque all-day event blocks overlap, a transparent all-day event does not, and invalid/missing timezone translation fails safely as `calendar_unavailable`; Phase 2-created appointments remain timed events.
 - `patch_event` sends only the application-owned fields and uses current ETag/`If-Match`; it does not send a full event object.
 - `create_event` accepts a caller-supplied event ID and private opaque Booking marker; it does not generate a random provider identity.
-- The double must model only busy/free intervals, recurring conflict instances, event retrieval, create/patch/delete, ETag conflicts, missing events, ambiguous post-write responses, and private-marker mismatch.
+- The double must model only busy/free intervals, recurring conflict instances, event retrieval, create/patch/delete, ETag conflicts, missing events, ambiguous post-write responses, private-marker mismatch, and the bounded pagination needed by conflict tests; it must not recreate Google pagination infrastructure generally.
 
 **Tests to write first:**
 
 - [ ] Test fake free/busy, conflict, get, create, patch, and cancellation behavior with no network.
-- [ ] Test Google request translation using mocked service/request/transport objects: calendar ID, time bounds, recurrence expansion, exact event ID, private marker, patch fields, conditional ETag, and bounded timeout.
+- [ ] Test Google credential construction uses exactly the two approved OAuth scopes and no broader scope.
+- [ ] Test Google request translation using mocked service/request/transport objects: Calendar ID, time bounds, `singleEvents=True`, `showDeleted=False`, recurrence expansion, exact event ID, private marker, patch fields, conditional ETag, and bounded timeout.
+- [ ] Test one-page conflict results, a blocking event present only on page 2, an excluded target on one page with a different blocker on another page, and termination when `nextPageToken` is absent; repeat the same query parameters on every page.
+- [ ] Test opaque one-day and multi-day all-day blocking events, transparent all-day events, half-open touching boundaries, and recurring expansion alongside all-day translation.
+- [ ] Test ordinary busy/free responses plus Calendar-level `notFound`, internal/provider, and unknown future free/busy errors; none may become `available=true` and raw reasons/bodies must not escape.
 - [ ] Test safe mapping of timeout/auth/quota/missing/412/ambiguous responses without raw payload leakage.
 - [ ] Test the double’s ambiguous create mode persists the event before raising a recoverable response.
 
@@ -356,6 +365,7 @@ especially the self-conflict-safe reschedule query.
 - Keep ordinary/create availability on `query_free_busy` for the effective buffered interval.
 - For reschedule, call `query_conflicts` over the effective buffered interval with the exact target event ID; never subtract the target’s old interval from free/busy.
 - Expand recurring blocking events through the Calendar boundary, ignore cancelled/transparent events, detect all other overlaps including another event occupying the target’s old interval, and preserve half-open edges.
+- Treat any embedded Calendar-level free/busy error as `calendar_unavailable` (or the existing bounded provider-equivalent error), even when the response has an empty or absent `busy` list; unknown provider reasons fail closed rather than producing `available=true`.
 
 **Tests to write first:**
 
@@ -366,6 +376,7 @@ especially the self-conflict-safe reschedule query.
 - [ ] Excluding a different event ID does not hide the target; excluding only the exact target ID works.
 - [ ] Events ending exactly at the effective start or starting exactly at the effective end do not conflict; positive overlap does.
 - [ ] Local Booking rows alone never make an interval unavailable.
+- [ ] Ordinary free, ordinary busy, Calendar `notFound`, Calendar internal/provider, and unknown future free/busy errors produce the correct bounded results; provider errors never report availability.
 
 **Acceptance criteria:**
 
@@ -832,6 +843,7 @@ application startup.
 
 - Add a guarded `make calendar-smoke` target that runs `uv run python scripts/calendar_smoke.py` only when explicit smoke opt-in and all runtime credentials are present.
 - Require a dedicated smoke marker/configuration value such as `RECEPTIONIST_CALENDAR_SMOKE_CONFIRM=DEDICATED_NON_PRODUCTION_ONLY`, a dedicated Calendar ID, and an explicit synthetic smoke environment.
+- Document the exact OAuth bootstrap scopes `https://www.googleapis.com/auth/calendar.events` and `https://www.googleapis.com/auth/calendar.freebusy`; do not use the broader `https://www.googleapis.com/auth/calendar` scope.
 - Refuse known production/customer identifiers when configured through a conservative allowlist/prefix or explicit dedicated-calendar marker; print the refusal without printing credentials.
 - The script creates or prepares a synthetic Contact/Conversation and uses the application operations to prove free/busy, confirmed create, same-key recovery/replay, `get_booking`, reschedule, cancellation, and cleanup.
 - Cleanup uses the persisted deterministic event ID and guarded cancellation; it does not delete arbitrary events or touch local production databases.
