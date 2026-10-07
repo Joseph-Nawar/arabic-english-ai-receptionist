@@ -8,9 +8,12 @@ does not execute provider workflows.
 
 ## Business configuration
 
-`BusinessConfig` is a singleton whose only legal primary-key value is `1`.
-There is no tenant, organization, or business-membership model. The reference
-configuration is validated as a strict Pydantic document before persistence.
+The authoritative business-domain configuration consists of the singleton
+`BusinessConfig` plus the relational `Service` catalog. Services are not
+embedded inside `BusinessConfig`. `BusinessConfig` is a singleton whose only
+legal primary-key value is `1`. There is no tenant, organization, or
+business-membership model. The reference configuration is validated as a
+strict Pydantic document before persistence.
 
 Business configuration owns the business name, IANA timezone, default phone
 region, currency, supported languages (`en` and `ar`), default language,
@@ -47,8 +50,9 @@ unresolved Contacts already exist.
 `whatsapp`, lifecycle `open` or `closed`, control mode `ai`,
 `handoff_pending`, or `human`, language mode `unknown`, `en`, `ar`, or `mixed`,
 an optional outcome, a bounded summary, and one current pending critical
-action. Open conversations have no close timestamp; closed conversations have
-one.
+action. Conversation outcomes are limited to `information_only`, `booked`,
+`rescheduled`, `cancelled`, `handoff`, `unresolved`, and `abandoned`. Open
+conversations have no close timestamp; closed conversations have one.
 
 The control state transitions are deliberately limited:
 
@@ -58,12 +62,16 @@ AI -> HANDOFF_PENDING -> HUMAN -> AI
 ```
 
 Invalid transitions raise one domain-state error. Pending actions are stored
-directly on Conversation. Only booking-critical action types are allowed:
-`create_booking`, `reschedule_booking`, and `cancel_booking`; status is either
-`awaiting_confirmation` or `confirmed`. Staging requires no existing action,
-confirmation requires an awaiting action and a confirmation timestamp, and
-clearing removes all action metadata. There is no pending-action history or
-workflow engine in Phase 1.
+directly on Conversation, so there is only one current action. Only
+booking-critical action types are allowed: `create_booking`,
+`reschedule_booking`, and `cancel_booking`; status is either
+`awaiting_confirmation` or `confirmed`. When no pending action exists, all
+pending-action metadata is null. When one exists, its type, status, payload,
+and created timestamp are required. `confirmed` requires `confirmed_at`;
+`awaiting_confirmation` requires `confirmed_at` to remain null; `expires_at`
+is optional. Staging requires no existing action, confirmation requires an
+awaiting action and a confirmation timestamp, and clearing removes all action
+metadata. There is no pending-action history or workflow engine in Phase 1.
 
 Conversation turns are append-oriented records with roles `customer`,
 `assistant`, `human`, or `system`, and unique sequence numbers per
@@ -73,14 +81,21 @@ conversation.
 
 - `Booking` records provider-independent contact/service booking state with
   optional UTC start/end pairs and statuses `pending`, `confirmed`, and
-  `cancelled`. It has no calendar/provider identifiers and no booking
-  workflow.
-- `Handoff` records a controlled operational request with status, reason, and
-  priority. At most one `pending` or `accepted` handoff may exist for a
-  conversation; resolved and cancelled history may coexist.
-- `ToolExecution` records the future side-effect boundary, including
-  sanitized arguments/results and an optional unique idempotency key. It does
-  not dispatch tools.
+  `cancelled`. `start_at` and `end_at` are either both null or both present;
+  when present, `start_at < end_at`. It has no calendar/provider identifiers
+  and no booking workflow.
+- `Handoff` records a controlled operational request. Its statuses are
+  `pending`, `accepted`, `resolved`, and `cancelled`; priorities are `normal`,
+  `high`, and `urgent`; reasons are `explicit_request`,
+  `repeated_misunderstanding`, `low_confidence`, `unknown_information`,
+  `complaint`, `unusual_or_high_risk`, `urgent_or_emergency`,
+  `integration_failure`, and `cannot_safely_act`. At most one `pending` or
+  `accepted` handoff may exist for a conversation; resolved and cancelled
+  history may coexist.
+- `ToolExecution` records the future side-effect boundary. Its statuses are
+  `started`, `succeeded`, `failed`, and `rejected`; it includes sanitized
+  arguments/results and an optional unique idempotency key. It does not
+  dispatch tools.
 - `AuditEvent` is the application append-only-by-convention audit trail with
   sanitized metadata and controlled actor types. Secrets, credentials, raw
   provider payloads, and unnecessary PII are excluded.
@@ -90,8 +105,27 @@ conversation.
   attempt count, and safe error code. It has no publisher, worker, queue, or
   retry scheduler in Phase 1.
 
+The approved pricing modes are `fixed`, `from`, `range`, `quote_required`,
+and `not_published`. These controlled vocabularies are persisted as constrained
+strings and must not be reinvented by later phases.
+
 Historical relationships use restrictive foreign keys. Phase 1 has no
 customer-data deletion or anonymization workflow.
+
+## Database-enforced invariants
+
+Controlled vocabularies use Python string enums with constrained VARCHAR
+persistence, not PostgreSQL native ENUM types. `BusinessConfig.id` is
+constrained to `1`. Non-null Contact E.164 identities are unique while
+multiple null identities are legal. ConversationTurn sequence numbers are
+unique per conversation. A partial unique index permits only one active
+(`pending` or `accepted`) Handoff per conversation. A partial unique index
+makes non-null ToolExecution idempotency keys unique. ProviderEventReceipt is
+unique on `(provider, external_event_id)`, and OutboxEvent has an index for
+unpublished rows.
+
+Phase 1 introduces the first real Alembic schema revision. SQLAlchemy metadata
+and migration drift are checked with `alembic check`.
 
 ## Authority boundaries
 
