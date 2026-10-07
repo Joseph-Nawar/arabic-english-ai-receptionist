@@ -10,7 +10,20 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
+from receptionist.domain.booking_policy import (
+    PolicyDecision,
+    RequestedInterval,
+    booking_state_fingerprint,
+    canonical_booking_snapshot,
+)
 from receptionist.domain.enums import BookingStatus, PendingActionType
+
+__all__ = [
+    "PolicyDecision",
+    "RequestedInterval",
+    "booking_state_fingerprint",
+    "canonical_booking_snapshot",
+]
 
 _MAX_DETAIL_KEYS = 16
 _FORBIDDEN_DETAIL_KEYS = {
