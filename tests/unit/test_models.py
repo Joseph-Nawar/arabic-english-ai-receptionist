@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import DateTime, Enum, SmallInteger
+from sqlalchemy import DateTime, Enum, SmallInteger, String
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 from receptionist.db import models
@@ -145,8 +145,39 @@ def test_historical_foreign_keys_are_restrictive() -> None:
 
 
 def test_booking_and_future_seams_have_no_provider_payload_or_identifier_columns() -> None:
-    booking_columns = set(Base.metadata.tables["booking"].columns.keys())
-    assert not booking_columns & {"google_event_id", "calendar_id", "calendar_provider"}
+    booking_table = Base.metadata.tables["booking"]
+    booking_columns = set(booking_table.columns.keys())
+    assert {"calendar_id", "calendar_event_id"} <= booking_columns
+    assert not booking_columns & {
+        "google_event_id",
+        "calendar_provider",
+        "etag",
+        "raw_payload",
+        "credentials",
+        "provider_json",
+    }
+    assert booking_table.c.calendar_id.nullable is True
+    assert booking_table.c.calendar_event_id.nullable is True
+    assert isinstance(booking_table.c.calendar_id.type, String)
+    assert isinstance(booking_table.c.calendar_event_id.type, String)
+    assert booking_table.c.calendar_id.type.length == 255
+    assert booking_table.c.calendar_event_id.type.length == 255
+
+    booking_constraints = _constraint_text("booking")
+    assert any(
+        "calendar_id" in constraint and "calendar_event_id" in constraint
+        for constraint in booking_constraints
+    )
+    assert any("status = 'confirmed'" in constraint for constraint in booking_constraints)
+    assert "uq_booking_calendar_event" in _index_names("booking")
+    calendar_index = next(
+        index for index in booking_table.indexes if index.name == "uq_booking_calendar_event"
+    )
+    assert calendar_index.unique is True
+    assert [column.name for column in calendar_index.columns] == [
+        "calendar_id",
+        "calendar_event_id",
+    ]
 
     for table_name in {"provider_event_receipt", "outbox_event", "tool_execution"}:
         columns = set(Base.metadata.tables[table_name].columns.keys())
