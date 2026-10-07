@@ -2,11 +2,11 @@
 
 ## Product shape
 
-The project is a configurable template for one business at a time: a portfolio demonstration of how an Arabic-English receptionist and customer-operations agent could be built for a single business configuration. It is intentionally not a multi-tenant SaaS platform and does not yet contain business or AI features.
+The project is a configurable template for one business at a time: a portfolio demonstration of how an Arabic-English receptionist and customer-operations agent could be built for a single business configuration. It is intentionally not a multi-tenant SaaS platform. Phase 1 establishes the business, identity, conversation-state, and durable operational primitives described in the [domain model](domain-model.md), but does not implement provider workflows or AI behavior.
 
 ## Core architecture
 
-The system is a modular monolith. FastAPI is the process boundary, and PostgreSQL is the durable store for this application's internal operational state; external systems retain the authoritative state explicitly assigned to them below. The Python modules are organized by responsibility rather than by speculative future packages. Phase 0 contains only application configuration, standard-library logging, database resources/metadata, Alembic wiring, and health routes.
+The system is a modular monolith. FastAPI is the process boundary, and PostgreSQL is the durable store for this application's internal operational state; external systems retain the authoritative state explicitly assigned to them below. The Python modules are organized by responsibility rather than by speculative future packages. Phase 1 adds the first real domain package and relational schema while preserving the explicit ownership boundaries below.
 
 Authority is explicit and follows this hierarchy:
 
@@ -21,7 +21,7 @@ Application code owns request coordination, configuration validation, and lifecy
 
 ## PostgreSQL responsibility
 
-PostgreSQL will own durable business, conversation, booking, handoff, and audit data in later phases. Phase 0 creates no domain tables. SQLAlchemy declarative metadata exists only so Alembic and later schema work have a stable metadata root. The development and test databases are separate infrastructure.
+PostgreSQL owns durable business, conversation, booking, handoff, and audit data. Phase 1 introduces the first domain tables; the development and test databases remain separate infrastructure.
 
 ## Realtime and asynchronous architecture
 

@@ -34,11 +34,12 @@ The reproducible local loop uses host Python/uv for FastAPI and Docker Compose o
    git status --short --ignored .env
    ```
 
-6. Start the development database, apply the currently empty Alembic schema, and run the web process on the host:
+6. Start the development database, apply the current Phase 1 Alembic schema, seed the synthetic reference catalog, and run the web process on the host:
 
    ```sh
    make db-up
    make migrate
+   make seed
    make dev
    ```
 
@@ -49,4 +50,4 @@ The reproducible local loop uses host Python/uv for FastAPI and Docker Compose o
    curl -i http://127.0.0.1:8000/health/ready
    ```
 
-The application does not run migrations automatically at startup. Stop infrastructure with `make db-down` when finished. The isolated test database uses `make test-db-up`, port `55432`, and database name `receptionist_test`; use `make test-db-down` to stop it.
+The application does not run migrations automatically at startup. Stop infrastructure with `make db-down` when finished. The isolated test database uses `make test-db-up`, port `55432`, and database name `receptionist_test`; use `make test-db-down` to stop it. The reference seed is synthetic/demo-only and refuses the `production` environment.
