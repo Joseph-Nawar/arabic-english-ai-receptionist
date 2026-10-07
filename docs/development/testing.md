@@ -32,7 +32,19 @@ make test
 
 ## Alembic verification
 
-There is no application revision yet. `make alembic-verify` proves that `upgrade head`, `downgrade base`, and `upgrade head` work against a clean test database without inventing a fake empty revision. `make migrate` applies the current head to the development database.
+Phase 1 includes the first real Alembic revision. `make alembic-verify` proves that `upgrade head`, `downgrade base`, and `upgrade head` work against a clean guarded test database. `make migrate` applies the current head to the development database.
+
+Migration and seed commands:
+
+```sh
+make migration MSG="describe the schema change"
+make migration-check
+make seed
+```
+
+`make migration` rejects an empty `MSG` before invoking Alembic. The supported autogeneration path produced the Phase 1 revision; verification must not create a disposable revision solely to test this target. `make migration-check` validates the existing test-database guard, upgrades only the guarded `receptionist_test` database to head, and runs `alembic check` to detect metadata drift. Set `TEST_DATABASE_URL` explicitly when the isolated PostgreSQL service uses a non-default port.
+
+The destructive migration cycle remains protected by `assert_safe_test_database`; it refuses non-test environments and any database name other than `receptionist_test`. The seed command is a thin invocation of the synthetic reference seed and has its own production refusal.
 
 ## Quality and security
 

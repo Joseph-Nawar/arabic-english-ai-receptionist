@@ -2,7 +2,8 @@ UV ?= uv
 DATABASE_URL ?= postgresql+psycopg://receptionist:receptionist@localhost:5432/receptionist
 TEST_DATABASE_URL ?= postgresql+psycopg://receptionist:receptionist@localhost:55432/receptionist_test
 
-.PHONY: install dev db-up db-down test-db-up test-db-down migrate test test-unit \
+.PHONY: install dev db-up db-down test-db-up test-db-down migrate migration \
+	migration-check seed test test-unit \
 	test-integration lint format format-check typecheck secrets audit security \
 	alembic-verify docker-config docker-build check verify
 
@@ -28,6 +29,18 @@ test-db-down:
 
 migrate:
 	RECEPTIONIST_APP_ENV=local RECEPTIONIST_DATABASE_URL="$(DATABASE_URL)" $(UV) run alembic upgrade head
+
+migration:
+	@if [ -z "$(MSG)" ]; then echo 'MSG is required, for example: make migration MSG="add service field"' >&2; exit 1; fi
+	RECEPTIONIST_APP_ENV=local RECEPTIONIST_DATABASE_URL="$(DATABASE_URL)" $(UV) run alembic revision --autogenerate -m "$(MSG)"
+
+migration-check:
+	RECEPTIONIST_APP_ENV=test RECEPTIONIST_DATABASE_URL="$(TEST_DATABASE_URL)" $(UV) run python -c 'from receptionist.core.config import Settings, assert_safe_test_database; settings = Settings(_env_file=None); assert_safe_test_database(settings)'
+	RECEPTIONIST_APP_ENV=test RECEPTIONIST_DATABASE_URL="$(TEST_DATABASE_URL)" $(UV) run alembic upgrade head
+	RECEPTIONIST_APP_ENV=test RECEPTIONIST_DATABASE_URL="$(TEST_DATABASE_URL)" $(UV) run alembic check
+
+seed:
+	$(UV) run python -m receptionist.seed
 
 test:
 	RECEPTIONIST_APP_ENV=test RECEPTIONIST_DATABASE_URL="$(TEST_DATABASE_URL)" $(UV) run pytest
@@ -72,4 +85,4 @@ docker-build:
 
 check: format-check lint typecheck secrets audit test-unit
 
-verify: check test-integration alembic-verify docker-config docker-build
+verify: check test-integration migration-check alembic-verify docker-config docker-build
