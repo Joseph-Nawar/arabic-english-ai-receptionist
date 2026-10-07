@@ -185,6 +185,16 @@ def test_service_area_aliases_are_normalized_for_ambiguity() -> None:
         validate_service_areas(areas)
 
 
+def test_service_area_codes_must_be_unique() -> None:
+    areas = [
+        ServiceAreaSpec(code="same", name_en="First", name_ar="الأول"),
+        ServiceAreaSpec(code="same", name_en="Second", name_ar="الثاني"),
+    ]
+
+    with pytest.raises(ValueError, match="codes must be unique"):
+        validate_service_areas(areas)
+
+
 def test_catalog_text_uses_basic_unicode_whitespace_and_case_normalization() -> None:
     assert normalize_catalog_text("  Cafe\u0301  Repair ") == "café repair"
 

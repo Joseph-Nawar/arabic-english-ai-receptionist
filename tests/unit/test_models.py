@@ -108,6 +108,22 @@ def test_required_indexes_are_registered() -> None:
         assert index_name in _index_names(table_name)
 
 
+def test_partial_index_predicates_are_explicit() -> None:
+    expected_predicates = {
+        ("contact", "uq_contact_phone_e164_non_null"): "phone_e164 IS NOT NULL",
+        ("handoff", "uq_handoff_active_conversation"): "status IN ('pending', 'accepted')",
+        ("tool_execution", "uq_tool_execution_idempotency_key_non_null"):
+            "idempotency_key IS NOT NULL",
+        ("outbox_event", "ix_outbox_event_unpublished"): "published_at IS NULL",
+    }
+
+    for (table_name, index_name), expected in expected_predicates.items():
+        index = next(
+            index for index in Base.metadata.tables[table_name].indexes if index.name == index_name
+        )
+        assert str(index.dialect_options["postgresql"]["where"]) == expected
+
+
 def test_pending_action_and_booking_invariants_are_metadata_constraints() -> None:
     conversation_checks = " ".join(_constraint_text("conversation"))
     booking_checks = " ".join(_constraint_text("booking"))

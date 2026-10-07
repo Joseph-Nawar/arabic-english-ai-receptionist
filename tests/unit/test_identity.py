@@ -33,6 +33,13 @@ def test_invalid_phone_values_are_rejected(raw_number: str, default_region: str 
         normalize_phone_number(raw_number, default_region)
 
 
+def test_impossible_and_extension_numbers_are_rejected() -> None:
+    with pytest.raises(PhoneNormalizationError, match="not possible"):
+        normalize_phone_number("+966123", None)
+    with pytest.raises(PhoneNormalizationError, match="extensions"):
+        normalize_phone_number("+1 202 555 0100 ext 89", None)
+
+
 def test_handoff_phone_is_canonicalized_as_international_e164() -> None:
     policy = HandoffPolicySpec(
         enabled=True,
