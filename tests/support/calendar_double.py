@@ -32,6 +32,8 @@ class DeterministicCalendarDouble:
         self._ambiguous_create_event_ids = ambiguous_create_event_ids or set()
         self._events: dict[tuple[str, str], CalendarEventSnapshot] = {}
         self._etag_counter = 0
+        self.free_busy_queries: list[tuple[str, datetime, datetime]] = []
+        self.conflict_queries: list[tuple[str, datetime, datetime, str | None]] = []
 
     def _next_etag(self) -> str:
         self._etag_counter += 1
@@ -44,6 +46,7 @@ class DeterministicCalendarDouble:
     async def query_free_busy(
         self, calendar_id: str, time_min: datetime, time_max: datetime
     ) -> tuple[CalendarBusyInterval, ...]:
+        self.free_busy_queries.append((calendar_id, time_min, time_max))
         if self._free_busy_error is not None:
             raise self._free_busy_error
         requested = CalendarInterval(time_min, time_max)
@@ -62,6 +65,7 @@ class DeterministicCalendarDouble:
         time_max: datetime,
         exclude_event_id: str | None = None,
     ) -> tuple[CalendarConflict, ...]:
+        self.conflict_queries.append((calendar_id, time_min, time_max, exclude_event_id))
         requested = CalendarInterval(time_min, time_max)
         conflicts = []
         for (event_calendar_id, event_id), event in self._events.items():

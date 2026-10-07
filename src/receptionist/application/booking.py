@@ -11,18 +11,29 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 from receptionist.domain.booking_policy import (
+    AvailabilityDecision,
     PolicyDecision,
     RequestedInterval,
     booking_state_fingerprint,
     canonical_booking_snapshot,
+    decide_availability,
+    intervals_overlap,
 )
 from receptionist.domain.enums import BookingStatus, PendingActionType
+from receptionist.integrations.google_calendar import (
+    CalendarClient,
+    CalendarClientError,
+    CalendarInterval,
+)
 
 __all__ = [
+    "AvailabilityDecision",
     "PolicyDecision",
     "RequestedInterval",
     "booking_state_fingerprint",
     "canonical_booking_snapshot",
+    "decide_availability",
+    "intervals_overlap",
 ]
 
 _MAX_DETAIL_KEYS = 16
@@ -332,3 +343,54 @@ class BookingErrorResult(_BookingModel):
     error: BookingError
 
     _operation_not_blank = field_validator("operation")(_require_non_blank)
+
+
+async def check_calendar_availability(
+    calendar: CalendarClient,
+    *,
+    calendar_id: str,
+    policy: PolicyDecision,
+    exclude_event_id: str | None = None,
+) -> AvailabilityDecision:
+    """Compose policy validity with the appropriate provider availability read."""
+    if not policy.valid:
+        return decide_availability(
+            policy_valid=False,
+            effective_interval=policy.effective_interval,
+            provider_intervals=(),
+            policy_error_code=policy.error_code,
+        )
+
+    effective_interval = policy.effective_interval
+    try:
+        if exclude_event_id is None:
+            busy_intervals = await calendar.query_free_busy(
+                calendar_id,
+                effective_interval.start_at_utc,
+                effective_interval.end_at_utc,
+            )
+            provider_intervals = tuple(
+                CalendarInterval(interval.start_at_utc, interval.end_at_utc)
+                for interval in busy_intervals
+            )
+        else:
+            conflicts = await calendar.query_conflicts(
+                calendar_id,
+                effective_interval.start_at_utc,
+                effective_interval.end_at_utc,
+                exclude_event_id=exclude_event_id,
+            )
+            provider_intervals = tuple(conflict.interval for conflict in conflicts)
+    except CalendarClientError as exc:
+        return AvailabilityDecision(
+            policy_valid=True,
+            provider_available=False,
+            error_code=exc.code.value,
+            effective_interval=effective_interval,
+        )
+
+    return decide_availability(
+        policy_valid=True,
+        effective_interval=effective_interval,
+        provider_intervals=provider_intervals,
+    )

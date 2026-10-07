@@ -22,6 +22,7 @@ from receptionist.domain.config import (
     normalize_catalog_text,
 )
 from receptionist.domain.enums import BookingStatus, Weekday
+from receptionist.integrations.google_calendar import CalendarInterval
 
 _OUTSIDE_BUSINESS_POLICY: Final = "outside_business_policy"
 _MAX_DETAIL_LENGTH: Final = 500
@@ -77,6 +78,16 @@ class PolicyDecision:
         return self.valid
 
 
+@dataclass(frozen=True)
+class AvailabilityDecision:
+    """The bounded result of composing policy with provider interval truth."""
+
+    policy_valid: bool
+    provider_available: bool
+    error_code: str | None
+    effective_interval: RequestedInterval
+
+
 def _normalize_aware_instant(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("datetime must be timezone-aware")
@@ -87,9 +98,10 @@ def _normalize_aware_instant(value: datetime) -> datetime:
         valid_offsets = {
             candidate.utcoffset()
             for fold in (0, 1)
-            if (
-                candidate := value.replace(fold=fold)
-            ).astimezone(UTC).astimezone(timezone_info).replace(tzinfo=None)
+            if (candidate := value.replace(fold=fold))
+            .astimezone(UTC)
+            .astimezone(timezone_info)
+            .replace(tzinfo=None)
             == wall_time
         }
         if not valid_offsets:
@@ -250,6 +262,37 @@ def evaluate_booking_policy(
         return _policy_failure(effective_interval)
 
     return PolicyDecision(valid=True, error_code=None, effective_interval=effective_interval)
+
+
+def intervals_overlap(left: RequestedInterval, right: CalendarInterval) -> bool:
+    """Use half-open interval semantics for provider conflict decisions."""
+    return left.start_at_utc < right.end_at_utc and right.start_at_utc < left.end_at_utc
+
+
+def decide_availability(
+    *,
+    policy_valid: bool,
+    effective_interval: RequestedInterval,
+    provider_intervals: tuple[CalendarInterval, ...],
+    policy_error_code: str | None = None,
+) -> AvailabilityDecision:
+    """Return availability only from policy validity and provider intervals."""
+    if not policy_valid:
+        return AvailabilityDecision(
+            policy_valid=False,
+            provider_available=False,
+            error_code=policy_error_code or _OUTSIDE_BUSINESS_POLICY,
+            effective_interval=effective_interval,
+        )
+    return AvailabilityDecision(
+        policy_valid=True,
+        provider_available=not any(
+            intervals_overlap(effective_interval, provider_interval)
+            for provider_interval in provider_intervals
+        ),
+        error_code=None,
+        effective_interval=effective_interval,
+    )
 
 
 def _canonical_datetime(value: datetime | None) -> str | None:

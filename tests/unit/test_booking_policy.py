@@ -7,13 +7,16 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from receptionist.domain.booking_policy import (
+    AvailabilityDecision,
     BusinessConfigView,
     CatalogSelectorAmbiguous,
     RequestedInterval,
     ServiceCatalogView,
     booking_state_fingerprint,
     canonical_booking_snapshot,
+    decide_availability,
     evaluate_booking_policy,
+    intervals_overlap,
     match_catalog_selector,
     normalize_requested_interval,
     validate_required_booking_details,
@@ -29,15 +32,14 @@ from receptionist.domain.config import (
     WeeklyHours,
 )
 from receptionist.domain.enums import BookingStatus, Weekday
+from receptionist.integrations.google_calendar import CalendarInterval
 from receptionist.seed import build_reference_business, build_reference_services
 
 pytestmark = pytest.mark.unit
 
 
 def _service(*, active: bool = True, bookable: bool = True) -> ServiceSpec:
-    return build_reference_services()[1].model_copy(
-        update={"active": active, "bookable": bookable}
-    )
+    return build_reference_services()[1].model_copy(update={"active": active, "bookable": bookable})
 
 
 def _interval_at(local_date: date, start: time, duration_minutes: int = 60) -> RequestedInterval:
@@ -188,13 +190,9 @@ def test_booking_policy_applies_weekly_hours_edges_buffers_notice_advance_and_sl
     before_open = evaluate_booking_policy(config, _interval_at(sunday, time(8, 0)), now_utc)
     assert before_open.error_code == "outside_business_policy"
 
-    closing_edge = evaluate_booking_policy(
-        config, _interval_at(sunday, time(18, 30), 75), now_utc
-    )
+    closing_edge = evaluate_booking_policy(config, _interval_at(sunday, time(18, 30), 75), now_utc)
     assert closing_edge.valid is True
-    after_close = evaluate_booking_policy(
-        config, _interval_at(sunday, time(19, 0), 75), now_utc
-    )
+    after_close = evaluate_booking_policy(config, _interval_at(sunday, time(19, 0), 75), now_utc)
     assert after_close.error_code == "outside_business_policy"
 
     friday = evaluate_booking_policy(
@@ -243,13 +241,67 @@ def test_booking_policy_rejects_cross_local_day_and_naive_now() -> None:
         )
 
 
+def test_availability_decision_is_policy_and_provider_truth_with_half_open_edges() -> None:
+    requested = RequestedInterval(
+        datetime(2026, 10, 11, 7, tzinfo=UTC),
+        datetime(2026, 10, 11, 8, tzinfo=UTC),
+    )
+    effective = RequestedInterval(
+        datetime(2026, 10, 11, 6, 45, tzinfo=UTC),
+        datetime(2026, 10, 11, 8, 15, tzinfo=UTC),
+    )
+    policy = AvailabilityDecision(
+        policy_valid=True,
+        provider_available=True,
+        error_code=None,
+        effective_interval=effective,
+    )
+
+    touching_before = CalendarInterval(
+        datetime(2026, 10, 11, 6, tzinfo=UTC),
+        datetime(2026, 10, 11, 6, 45, tzinfo=UTC),
+    )
+    touching_after = CalendarInterval(
+        datetime(2026, 10, 11, 8, 15, tzinfo=UTC),
+        datetime(2026, 10, 11, 9, tzinfo=UTC),
+    )
+    assert intervals_overlap(requested, touching_before) is False
+    assert intervals_overlap(requested, touching_after) is False
+    assert intervals_overlap(effective, touching_before) is False
+    assert intervals_overlap(effective, touching_after) is False
+
+    free = decide_availability(
+        policy_valid=True,
+        effective_interval=effective,
+        provider_intervals=(touching_before, touching_after),
+    )
+    assert free == AvailabilityDecision(True, True, None, effective)
+
+    blocking = CalendarInterval(
+        datetime(2026, 10, 11, 8, tzinfo=UTC),
+        datetime(2026, 10, 11, 8, 30, tzinfo=UTC),
+    )
+    busy = decide_availability(
+        policy_valid=True,
+        effective_interval=effective,
+        provider_intervals=(blocking,),
+    )
+    assert busy == AvailabilityDecision(True, False, None, effective)
+
+    invalid = decide_availability(
+        policy_valid=False,
+        effective_interval=effective,
+        provider_intervals=(),
+        policy_error_code="outside_business_policy",
+    )
+    assert invalid == AvailabilityDecision(False, False, "outside_business_policy", effective)
+
+
 def test_booking_policy_uses_configured_timezone_for_dst_zone() -> None:
     timezone = "America/New_York"
     config = BusinessConfigView(
         timezone=timezone,
-        weekly_hours=WeeklyHours(
-            days={Weekday.SUNDAY: [TimeWindow(start=time(1), end=time(4))]}
-        ),
+        weekly_hours=WeeklyHours(days={Weekday.SUNDAY: [TimeWindow(start=time(1), end=time(4))]}),
         booking_policy=BookingPolicySpec(
             minimum_notice_minutes=0,
             maximum_advance_days=30,
