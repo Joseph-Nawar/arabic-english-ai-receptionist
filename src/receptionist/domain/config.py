@@ -18,6 +18,7 @@ from receptionist.domain.enums import (
     PricingMode,
     Weekday,
 )
+from receptionist.domain.identity import PhoneNormalizationError, normalize_phone_number
 
 _CURRENCY_PATTERN = re.compile(r"^[A-Z]{3}$")
 
@@ -81,6 +82,18 @@ class HandoffPolicySpec(_StrictModel):
     enabled: bool
     handoff_phone_e164: str | None = None
     business_hours_only: bool
+
+    @field_validator("handoff_phone_e164")
+    @classmethod
+    def validate_handoff_phone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            return normalize_phone_number(value, None)
+        except PhoneNormalizationError as exc:
+            raise ValueError(
+                "handoff_phone_e164 must be a valid international E.164 number"
+            ) from exc
 
 
 class RetentionPolicySpec(_StrictModel):
