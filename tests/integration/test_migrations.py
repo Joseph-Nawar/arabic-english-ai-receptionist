@@ -37,6 +37,14 @@ def test_alembic_upgrade_downgrade_upgrade_cycle(integration_settings, monkeypat
     config = Config("alembic.ini")
     command.upgrade(config, "head")
     command.downgrade(config, "base")
+
+    downgraded_engine = create_engine(database_url)
+    try:
+        with downgraded_engine.connect() as connection:
+            assert EXPECTED_TABLES.isdisjoint(set(inspect(connection).get_table_names()))
+    finally:
+        downgraded_engine.dispose()
+
     command.upgrade(config, "head")
 
     assert os.environ["RECEPTIONIST_DATABASE_URL"] == database_url

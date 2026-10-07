@@ -81,7 +81,7 @@ docker-config:
 	docker compose config
 
 docker-build:
-	docker build -t arabic-english-ai-receptionist:phase-0 .
+	docker build -t arabic-english-ai-receptionist:local .
 
 check: format-check lint typecheck secrets audit test-unit
 

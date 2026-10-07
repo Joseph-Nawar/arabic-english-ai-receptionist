@@ -31,6 +31,8 @@ from receptionist.domain.enums import (
     HandoffPriority,
     HandoffReason,
     HandoffStatus,
+    PendingActionStatus,
+    PendingActionType,
     ToolExecutionStatus,
 )
 from receptionist.seed import build_reference_business, build_reference_services
@@ -107,6 +109,116 @@ async def test_invalid_conversation_contact_foreign_key_is_rejected(session_fact
         with pytest.raises(IntegrityError):
             await session.flush()
         await session.rollback()
+
+
+async def test_conversation_lifecycle_constraints_are_enforced(session_factory) -> None:
+    contact_id, _, _ = await _create_contact_conversation_service(session_factory)
+    closed_at = datetime(2026, 1, 1, 11, tzinfo=UTC)
+
+    for invalid_values in (
+        {"status": ConversationStatus.OPEN, "closed_at": closed_at},
+        {"status": ConversationStatus.CLOSED, "closed_at": None},
+    ):
+        async with session_factory() as session:
+            session.add(
+                Conversation(
+                    contact_id=contact_id,
+                    channel=ConversationChannel.PHONE,
+                    control_mode=ControlMode.AI,
+                    language_mode=ConversationLanguageMode.UNKNOWN,
+                    **invalid_values,
+                )
+            )
+            with pytest.raises(IntegrityError):
+                await session.flush()
+            await session.rollback()
+
+    async with session_factory.begin() as session:
+        session.add_all(
+            [
+                Conversation(
+                    contact_id=contact_id,
+                    channel=ConversationChannel.PHONE,
+                    status=ConversationStatus.OPEN,
+                    control_mode=ControlMode.AI,
+                    language_mode=ConversationLanguageMode.UNKNOWN,
+                ),
+                Conversation(
+                    contact_id=contact_id,
+                    channel=ConversationChannel.PHONE,
+                    status=ConversationStatus.CLOSED,
+                    control_mode=ControlMode.AI,
+                    language_mode=ConversationLanguageMode.UNKNOWN,
+                    closed_at=closed_at,
+                ),
+            ]
+        )
+
+
+async def test_pending_action_constraints_are_enforced(session_factory) -> None:
+    contact_id, _, _ = await _create_contact_conversation_service(session_factory)
+    created_at = datetime(2026, 1, 1, 10, tzinfo=UTC)
+    confirmed_at = created_at + timedelta(minutes=1)
+    common_values = {
+        "contact_id": contact_id,
+        "channel": ConversationChannel.PHONE,
+        "status": ConversationStatus.OPEN,
+        "control_mode": ControlMode.AI,
+        "language_mode": ConversationLanguageMode.UNKNOWN,
+    }
+    invalid_values = (
+        {
+            "pending_action_status": PendingActionStatus.AWAITING_CONFIRMATION,
+            "pending_action_payload": {},
+            "pending_action_created_at": created_at,
+        },
+        {
+            "pending_action_type": PendingActionType.CREATE_BOOKING,
+            "pending_action_status": PendingActionStatus.AWAITING_CONFIRMATION,
+        },
+        {
+            "pending_action_type": PendingActionType.CREATE_BOOKING,
+            "pending_action_status": PendingActionStatus.CONFIRMED,
+            "pending_action_payload": {},
+            "pending_action_created_at": created_at,
+        },
+        {
+            "pending_action_type": PendingActionType.CREATE_BOOKING,
+            "pending_action_status": PendingActionStatus.AWAITING_CONFIRMATION,
+            "pending_action_payload": {},
+            "pending_action_created_at": created_at,
+            "pending_action_confirmed_at": confirmed_at,
+        },
+    )
+
+    for pending_values in invalid_values:
+        async with session_factory() as session:
+            session.add(Conversation(**common_values, **pending_values))
+            with pytest.raises(IntegrityError):
+                await session.flush()
+            await session.rollback()
+
+    async with session_factory.begin() as session:
+        session.add_all(
+            [
+                Conversation(**common_values),
+                Conversation(
+                    **common_values,
+                    pending_action_type=PendingActionType.CREATE_BOOKING,
+                    pending_action_status=PendingActionStatus.AWAITING_CONFIRMATION,
+                    pending_action_payload={"service_code": "plumbing"},
+                    pending_action_created_at=created_at,
+                ),
+                Conversation(
+                    **common_values,
+                    pending_action_type=PendingActionType.CREATE_BOOKING,
+                    pending_action_status=PendingActionStatus.CONFIRMED,
+                    pending_action_payload={"service_code": "plumbing"},
+                    pending_action_created_at=created_at,
+                    pending_action_confirmed_at=confirmed_at,
+                ),
+            ]
+        )
 
 
 async def test_conversation_turn_sequence_is_unique_per_conversation(session_factory) -> None:
@@ -328,9 +440,22 @@ async def test_tool_idempotency_and_provider_receipt_uniqueness(session_factory)
         await session.rollback()
 
     async with session_factory.begin() as session:
-        session.add(
-            ProviderEventReceipt(provider="provider_b", external_event_id=external_event_id)
+        session.add_all(
+            [
+                ProviderEventReceipt(provider="provider_a", external_event_id=external_event_id),
+                ProviderEventReceipt(provider="provider_b", external_event_id=external_event_id),
+            ]
         )
+
+    async with session_factory() as session:
+        receipts = (
+            await session.scalars(
+                select(ProviderEventReceipt).where(
+                    ProviderEventReceipt.external_event_id == external_event_id
+                )
+            )
+        ).all()
+        assert {receipt.provider for receipt in receipts} == {"provider_a", "provider_b"}
 
 
 async def test_database_rejects_invalid_controlled_strings(session_factory) -> None:
@@ -345,18 +470,19 @@ async def test_database_rejects_invalid_controlled_strings(session_factory) -> N
 
 async def test_phase_one_event_records_store_sanitized_payloads(session_factory) -> None:
     contact_id, _, conversation_id = await _create_contact_conversation_service(session_factory)
+    event_type = f"phase1.test.{uuid.uuid4().hex}"
 
     async with session_factory.begin() as session:
         session.add_all(
             [
                 AuditEvent(
-                    event_type="phase1.test",
+                    event_type=event_type,
                     actor_type=AuditActorType.SYSTEM,
                     contact_id=contact_id,
                     conversation_id=conversation_id,
                     sanitized_metadata={"safe": True},
                 ),
-                OutboxEvent(event_type="phase1.test", payload={"safe": True}),
+                OutboxEvent(event_type=event_type, payload={"safe": True}),
             ]
         )
 
@@ -365,7 +491,7 @@ async def test_phase_one_event_records_store_sanitized_payloads(session_factory)
             select(AuditEvent).where(AuditEvent.conversation_id == conversation_id)
         )
         outbox = await session.scalar(
-            select(OutboxEvent).where(OutboxEvent.event_type == "phase1.test")
+            select(OutboxEvent).where(OutboxEvent.event_type == event_type)
         )
         assert audit is not None
         assert audit.sanitized_metadata == {"safe": True}

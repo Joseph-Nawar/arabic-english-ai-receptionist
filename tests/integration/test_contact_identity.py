@@ -77,7 +77,7 @@ async def test_same_phone_resolution_is_idempotent(integration_settings) -> None
 
 async def test_concurrent_same_phone_workers_commit_before_return(integration_settings) -> None:
     resources = create_database_resources(integration_settings)
-    canonical = "+966581234567"
+    canonical = f"+96658{uuid.uuid4().int % 10**7:07d}"
 
     async def worker() -> uuid.UUID:
         async with resources.session_factory() as session:
@@ -87,6 +87,12 @@ async def test_concurrent_same_phone_workers_commit_before_return(integration_se
             return contact_id
 
     try:
+        async with resources.session_factory() as session:
+            existing = await session.scalar(
+                select(Contact.id).where(Contact.phone_e164 == canonical)
+            )
+        assert existing is None
+
         resolved_ids = await asyncio.wait_for(asyncio.gather(worker(), worker()), timeout=5)
 
         assert resolved_ids[0] == resolved_ids[1]

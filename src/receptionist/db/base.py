@@ -1,7 +1,7 @@
-"""Declarative metadata root for future application tables."""
+"""Declarative metadata root for application tables."""
 
 from sqlalchemy.orm import DeclarativeBase
 
 
 class Base(DeclarativeBase):
-    """Empty metadata root retained for Alembic and later schema phases."""
+    """Metadata root used by Alembic and the domain schema."""
