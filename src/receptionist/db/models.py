@@ -98,9 +98,7 @@ class BusinessConfig(Base):
     created_at: Mapped[datetime] = _created_at_column()
     updated_at: Mapped[datetime] = _updated_at_column()
 
-    __table_args__ = (
-        CheckConstraint("id = 1", name="ck_business_config_singleton"),
-    )
+    __table_args__ = (CheckConstraint("id = 1", name="ck_business_config_singleton"),)
 
 
 class Service(Base):

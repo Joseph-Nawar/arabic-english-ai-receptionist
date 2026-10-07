@@ -337,10 +337,7 @@ async def test_database_rejects_invalid_controlled_strings(session_factory) -> N
     async with session_factory() as session:
         with pytest.raises(IntegrityError):
             await session.execute(
-                text(
-                    "INSERT INTO contact (id, preferred_language) "
-                    "VALUES (:id, 'xx')"
-                ),
+                text("INSERT INTO contact (id, preferred_language) VALUES (:id, 'xx')"),
                 {"id": uuid.uuid4()},
             )
         await session.rollback()

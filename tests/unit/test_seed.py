@@ -44,7 +44,7 @@ async def test_production_seed_refuses_before_opening_database(monkeypatch) -> N
     settings = Settings(
         _env_file=None,
         app_env="production",
-        database_url="postgresql+psycopg://receptionist:receptionist@localhost/receptionist_test",
+        database_url="postgresql+psycopg://localhost/receptionist_test",
     )
     with pytest.raises(RuntimeError, match="production"):
         await seed.run_seed(settings)

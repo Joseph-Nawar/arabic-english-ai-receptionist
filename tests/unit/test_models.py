@@ -112,8 +112,10 @@ def test_partial_index_predicates_are_explicit() -> None:
     expected_predicates = {
         ("contact", "uq_contact_phone_e164_non_null"): "phone_e164 IS NOT NULL",
         ("handoff", "uq_handoff_active_conversation"): "status IN ('pending', 'accepted')",
-        ("tool_execution", "uq_tool_execution_idempotency_key_non_null"):
-            "idempotency_key IS NOT NULL",
+        (
+            "tool_execution",
+            "uq_tool_execution_idempotency_key_non_null",
+        ): "idempotency_key IS NOT NULL",
         ("outbox_event", "ix_outbox_event_unpublished"): "published_at IS NULL",
     }
 

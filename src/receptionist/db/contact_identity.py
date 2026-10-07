@@ -35,9 +35,7 @@ async def resolve_or_create_contact(
     if inserted_contact is not None:
         return inserted_contact
 
-    resolved_contact = await session.scalar(
-        select(Contact).where(Contact.phone_e164 == phone_e164)
-    )
+    resolved_contact = await session.scalar(select(Contact).where(Contact.phone_e164 == phone_e164))
     if resolved_contact is None:
         raise RuntimeError("contact conflict did not resolve to a persisted contact")
     return resolved_contact

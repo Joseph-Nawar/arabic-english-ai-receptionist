@@ -156,9 +156,7 @@ def test_weekly_hours_reject_invalid_or_overlapping_windows(
     with pytest.raises(ValidationError):
         WeeklyHours(
             days={
-                Weekday.SUNDAY: [
-                    TimeWindow(start=start, end=end) for start, end in window_values
-                ]
+                Weekday.SUNDAY: [TimeWindow(start=start, end=end) for start, end in window_values]
             }
         )
 
