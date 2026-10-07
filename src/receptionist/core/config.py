@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     app_env: AppEnvironment = "local"
     log_level: LogLevel = "INFO"
     database_url: SecretStr = Field(repr=False)
+    google_calendar_id: str | None = None
+    google_oauth_client_id: SecretStr | None = Field(default=None, repr=False)
+    google_oauth_client_secret: SecretStr | None = Field(default=None, repr=False)
+    google_oauth_refresh_token: SecretStr | None = Field(default=None, repr=False)
+    google_calendar_request_timeout_seconds: float = Field(default=10.0, gt=0, le=30)
 
     model_config = SettingsConfigDict(
         env_prefix="RECEPTIONIST_",
@@ -37,17 +42,46 @@ class Settings(BaseSettings):
             raise ValueError("database_url must include a database name")
         return value
 
+    @field_validator("google_calendar_id")
+    @classmethod
+    def validate_google_calendar_id(cls, value: str | None) -> str | None:
+        """Reject a configured Calendar ID that contains no non-whitespace value."""
+        if value is not None and not value.strip():
+            raise ValueError("google_calendar_id must not be blank")
+        return value
+
     @property
     def database_url_value(self) -> str:
         """Return the URL for SQLAlchemy internals; callers must not log it."""
         return self.database_url.get_secret_value()
 
-    def safe_summary(self) -> dict[str, str | bool]:
+    @property
+    def google_calendar_configured(self) -> bool:
+        """Return whether all non-blank Google Calendar credentials are present."""
+        required_values = (
+            self.google_calendar_id,
+            self.google_oauth_client_id,
+            self.google_oauth_client_secret,
+            self.google_oauth_refresh_token,
+        )
+        return all(
+            value is not None
+            and (
+                not isinstance(value, SecretStr)
+                or bool(value.get_secret_value().strip())
+            )
+            and (not isinstance(value, str) or bool(value.strip()))
+            for value in required_values
+        )
+
+    def safe_summary(self) -> dict[str, str | bool | float]:
         """Return configuration details safe for ordinary logs."""
         return {
             "app_env": self.app_env,
             "log_level": self.log_level,
             "database_configured": True,
+            "google_calendar_configured": self.google_calendar_configured,
+            "google_calendar_request_timeout_seconds": self.google_calendar_request_timeout_seconds,
         }
 
 
