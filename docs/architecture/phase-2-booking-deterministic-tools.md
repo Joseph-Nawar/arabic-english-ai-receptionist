@@ -57,8 +57,9 @@ claiming or mutating Calendar state.
 `check_availability` returns real Google Calendar free/busy information for the
 requested interval after local policy validation. A `true` result means the
 configured calendar reported no busy interval for the effective buffered
-interval at that read; it is not a reservation. Create and reschedule always
-repeat the free/busy check immediately before the Calendar write.
+interval at that read; it is not a reservation. Create repeats that free/busy
+check immediately before the Calendar write. Reschedule uses the separate
+conflict-aware event query so the target event can be excluded by exact ID.
 
 ### Request and result shapes
 
@@ -133,17 +134,18 @@ implementation.
 The capability surface has only these operations:
 
 - `query_free_busy(calendar_id, time_min, time_max)`;
+- `query_conflicts(calendar_id, time_min, time_max, exclude_event_id=None)`;
 - `get_event(calendar_id, event_id)`;
 - `create_event(calendar_id, event_id, event_request)`;
-- `update_event(calendar_id, event_id, event_request, if_match_etag)`; and
+- `patch_event(calendar_id, event_id, owned_fields, if_match_etag)`; and
 - `cancel_event(calendar_id, event_id, if_match_etag)`.
 
 The Google implementation uses the official Python Google API client and
 Google authentication libraries. `query_free_busy` uses Calendar's free/busy
 endpoint, and event writes use the events API. The implementation maps Google
-responses into small application-owned event/free-busy models and maps raw
-provider failures into the application error vocabulary. Raw Google payloads
-never cross the application boundary or enter durable JSON.
+responses into small application-owned event/free-busy/conflict models and maps
+raw provider failures into the application error vocabulary. Raw Google
+payloads never cross the application boundary or enter durable JSON.
 
 The single-business deployment uses one operator-owned OAuth 2.0 authorized-
 user refresh token, provisioned out-of-band during deployment, plus a runtime
@@ -180,9 +182,21 @@ returns the normalized interval, policy result, busy/free result, and a
 read-timestamped safe status. It does not invent alternative slots or persist
 a reservation.
 
-Immediately before Calendar create or update, the finalization step repeats
-the policy evaluation and free/busy query. An earlier `check_availability`
-result or preparation result is advisory only and cannot authorize the write.
+Reschedule availability uses `query_conflicts`, not free/busy subtraction. The
+Google implementation lists events over the effective buffered interval with
+recurrence expansion enabled, converts only blocking events into the narrow
+application-owned conflict model, and excludes only the exact supplied target
+event ID. Cancelled or transparent events are not blocking; every other
+blocking event is considered. The result contains opaque event IDs and UTC
+intervals, never raw Google Event objects. Because the target is excluded by
+identity rather than by subtracting its old interval, another event occupying
+the same old interval remains a conflict.
+
+Immediately before Calendar create, the finalization step repeats the policy
+evaluation and free/busy query. Immediately before Calendar reschedule, it
+repeats the policy evaluation and conflict-aware event query with the exact
+target event excluded. An earlier availability or conflict result and any
+preparation result are advisory only and cannot authorize the write.
 
 The application serializes its own create/reschedule/cancel provider writes by
 locking the existing singleton `BusinessConfig(id=1)` row for the bounded
@@ -296,6 +310,20 @@ The configured calendar ID remains runtime configuration, while the persisted
 copy lets retrieval and reconciliation detect a configuration change instead
 of looking in the wrong calendar.
 
+For a create claim, the pair is persisted before Google necessarily has an
+event: while `status=pending`, `calendar_id` identifies the target Calendar and
+`calendar_event_id` is the deterministic reserved provider identity that may
+or may not exist externally. The pair's presence is not proof of an external
+event. Only `status=confirmed` after successful provider reconciliation proves
+that the referenced Google event exists and matches local state.
+
+If a create is definitively rejected before an event was created, such as when
+the final availability recheck is busy, the finalization clears both Calendar
+reference columns while moving the local intent to `cancelled`. If an event
+was successfully created and the Booking is later
+cancelled, retaining the historical Calendar ID and event ID is allowed and
+useful for audit and reconciliation.
+
 The Phase 1 `Booking.status` vocabulary is retained:
 
 - `pending` means a locally accepted/in-progress booking intent whose Calendar
@@ -357,8 +385,9 @@ interval, policy, or Conversation state is invalid. An exact existing active
 local booking for the same contact, service, area, and interval is treated as a
 safe `duplicate_replay` rejection when presented with a different idempotency
 key. Calendar free/busy remains the authority for actual capacity. If the
-final availability recheck is busy, no event is created and the pending local
-intent is finalized as cancelled with a rejected ToolExecution. If the
+final availability recheck is busy, no event is created, both reserved Calendar
+reference columns are cleared, and the pending local intent is finalized as
+cancelled with a rejected ToolExecution. If the
 provider result is ambiguous, the row remains pending and the same key resumes
 reconciliation; no second event is inserted.
 
@@ -367,18 +396,25 @@ reconciliation; no second event is inserted.
 Reschedule targets one existing local Booking. Preparation locks and validates
 the target, requires a Phase 2-managed confirmed Booking with both Calendar
 references, preserves its service and area, validates the new interval against
-current policy and Calendar free/busy, and stages a `reschedule_booking`
-action containing the target Booking identifier, canonical new values, and an
-expected-state fingerprint. Confirmation locks the Booking again and compares
-that fingerprint before establishing the pending provider operation.
+current policy and the conflict-aware Calendar event query excluding the exact
+target `calendar_event_id`, and stages a `reschedule_booking` action containing
+the target Booking identifier, canonical new values, and an expected-state
+fingerprint. Confirmation locks the Booking again and compares that fingerprint
+before establishing the pending provider operation.
+
+The conflict query covers the effective buffered interval, expands recurring
+Calendar events, ignores only the exact target event ID, and treats every
+other blocking event as a conflict. It does not subtract the old target
+interval from free/busy and does not infer capacity from local Booking rows.
 
 The claim transaction changes the Booking to `pending` while retaining the
 last reconciled interval in its normal columns; the desired new interval and
 the expected prior state remain in the ToolExecution arguments. The provider
-step locks the single-business fence, rechecks free/busy, fetches the current
-event, and updates it with the current ETag. Only the reconciled Calendar
-response changes the Booking interval, request metadata, and status back to
-`confirmed`.
+step locks the single-business fence, re-runs the conflict-aware query with the
+exact target event excluded, fetches the current event, and patches only the
+application-owned event fields with the current ETag. Only the reconciled
+Calendar response changes the Booking interval, request metadata, and status
+back to `confirmed`.
 
 A cancelled Booking is rejected with `booking_state_conflict`. A pending
 Booking with a different active operation is `operation_in_progress`. A
@@ -533,10 +569,11 @@ still need to happen; it is a recoverable state, not a work queue.
    single-calendar application write fence. Then lock Conversation and Booking
    in that order and revalidate the execution/action state.
 2. Re-run current local policy and query Google free/busy immediately before
-   create or reschedule. An earlier availability result never authorizes a
-   write.
-3. Perform the bounded Google create/update/delete operation using the known
-   Calendar and event identity. For update/delete, fetch the current event and
+   create. For reschedule, query conflicts over the effective buffered
+   interval while excluding the exact target event ID. An earlier availability
+   result never authorizes a write.
+3. Perform the bounded Google create/patch/delete operation using the known
+   Calendar and event identity. For patch/delete, fetch the current event and
    use its current ETag for conditional mutation.
 4. Reconcile the response. If the response is ambiguous, fetch the known
    event identity and verify the private Booking marker and expected interval.
@@ -578,12 +615,15 @@ boundary retrieves that exact event, verifies the marker and expected request,
 and treats a matching event as the original success. A mismatched event is
 `external_state_conflict` and is never adopted.
 
-For reschedule, the boundary gets the current event, performs a full update
-with `If-Match`/current ETag semantics, and persists the reconciled returned
-interval. A 412/precondition failure is `external_state_conflict`; the local
-Booking is not overwritten. For cancellation, the boundary gets the event and
-deletes it conditionally. A 404 means the event is already absent and is a
-successful reconciliation; an ETag conflict is an external state conflict.
+For reschedule, the boundary gets the current event, verifies its required
+private marker, and performs a minimal patch containing only the
+application-owned start/end fields with `If-Match`/current ETag semantics. It
+does not send a full event representation and therefore preserves unrelated
+operator/provider-owned metadata. A 412/precondition failure is
+`external_state_conflict`; the local Booking is not overwritten. For
+cancellation, the boundary gets the event and deletes it conditionally. A 404
+means the event is already absent and is a successful reconciliation; an ETag
+conflict is an external state conflict.
 
 ## Error vocabulary
 
@@ -740,7 +780,8 @@ The test matrix includes:
   reschedule, cancellation, and retrieval, including durable reload in a new
   session and Calendar-reference pair/uniqueness constraints;
 - Calendar-boundary tests using a narrow deterministic test double for free/busy,
-  get, create, update, and cancel, with explicit timeout/error mapping;
+  conflict queries, get, create, patch, and cancel, with explicit
+  timeout/error mapping;
 - tests that prove `check_availability` uses service duration, business hours,
   buffers, slot increment, notice/advance policy, and provider busy intervals;
 - integration tests proving only explicit confirmation mutates Booking and
@@ -755,8 +796,12 @@ The test matrix includes:
 - crash/retry reconciliation tests for provider success followed by local
   finalization failure, including create without duplicate event creation;
 - availability recheck tests immediately before create/reschedule, provider
-  busy/conflict/ETag failure tests, and cancellation of an already-absent
-  event;
+  busy/conflict/ETag failure tests, cancellation of an already-absent event,
+  and minimal patch preservation of unrelated event metadata;
+- reschedule conflict tests where the proposed interval overlaps only the
+  target's old event (including a buffer overlap) and is allowed, the same
+  cases with another blocking event are rejected, recurring blocking events
+  are expanded, and only the exact target event ID is excluded;
 - rollback tests proving a failed local mutation leaves Conversation, Booking,
   ToolExecution, and AuditEvent consistent;
 - service active/bookable and service-area catalog tests, including exact
