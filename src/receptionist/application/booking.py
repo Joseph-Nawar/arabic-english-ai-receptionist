@@ -1058,9 +1058,7 @@ async def _claim_create_confirmation(
                 raise ValueError("pending requirements are invalid")
             interval = _stored_interval(payload)
             business_spec = _business_spec(business)
-            service = await session.scalar(
-                select(Service).where(Service.code == service_code)
-            )
+            service = await session.scalar(select(Service).where(Service.code == service_code))
             if service is None or not service.active or not service.bookable:
                 raise ValueError("pending service is no longer bookable")
             area, area_error = _resolve_area(business_spec, area_code)
@@ -1823,6 +1821,8 @@ async def _finalize_managed_booking_confirmation(
             action_type=expected_action_type,
             now=now,
         )
+
+
 def _create_confirmation_success(
     session: AsyncSession,
     *,
@@ -2154,6 +2154,8 @@ async def _finalize_create_confirmation(
             event_id=event_id,
             now=now,
         )
+
+
 def _request_arguments(request: CreateBookingRequest) -> dict[str, object]:
     return {
         "conversation_id": str(request.conversation_id),

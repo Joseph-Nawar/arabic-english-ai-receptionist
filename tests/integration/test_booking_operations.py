@@ -104,9 +104,7 @@ async def _operation_context(session_factory) -> tuple[uuid.UUID, uuid.UUID, uui
         return contact.id, conversation.id, service_id
 
 
-async def _conversation_for_contact(
-    session_factory, contact_id: uuid.UUID
-) -> uuid.UUID:
+async def _conversation_for_contact(session_factory, contact_id: uuid.UUID) -> uuid.UUID:
     async with session_factory.begin() as session:
         conversation = Conversation(
             contact_id=contact_id,
@@ -954,8 +952,7 @@ def test_deterministic_calendar_event_id_is_stable_and_google_safe() -> None:
     assert event_id.startswith("receptionist-booking-")
     assert len(event_id) <= 1024
     assert all(
-        character.islower() or character.isdigit() or character in "-_"
-        for character in event_id
+        character.islower() or character.isdigit() or character in "-_" for character in event_id
     )
     assert str(booking_id) not in event_id
 
@@ -993,9 +990,13 @@ async def test_confirm_create_reconciles_booking_and_clears_action(session_facto
         execution = await session.scalar(
             select(ToolExecution).where(ToolExecution.idempotency_key == confirmation_key)
         )
-        booking = await session.scalar(
-            select(Booking).where(Booking.contact_id == conversation.contact_id)
-        ) if conversation is not None else None
+        booking = (
+            await session.scalar(
+                select(Booking).where(Booking.contact_id == conversation.contact_id)
+            )
+            if conversation is not None
+            else None
+        )
         audits = (
             await session.scalars(
                 select(AuditEvent).where(AuditEvent.conversation_id == conversation_id)
@@ -1035,12 +1036,8 @@ async def test_confirm_create_same_key_replays_without_second_calendar_event(
         idempotency_key=f"confirm-replay-{uuid.uuid4()}",
     )
 
-    first = await confirm_booking_action(
-        session_factory, calendar, request, now_utc=NOW_UTC
-    )
-    replay = await confirm_booking_action(
-        session_factory, calendar, request, now_utc=NOW_UTC
-    )
+    first = await confirm_booking_action(session_factory, calendar, request, now_utc=NOW_UTC)
+    replay = await confirm_booking_action(session_factory, calendar, request, now_utc=NOW_UTC)
 
     assert isinstance(first, ConfirmationResult)
     assert isinstance(replay, ConfirmationResult)
@@ -1128,9 +1125,13 @@ async def test_confirm_create_existing_event_with_foreign_marker_is_not_adopted(
     assert result.error.code is BookingErrorCode.EXTERNAL_STATE_CONFLICT
     async with session_factory() as session:
         conversation = await session.get(Conversation, conversation_id)
-        booking = await session.scalar(
-            select(Booking).where(Booking.contact_id == conversation.contact_id)
-        ) if conversation is not None else None
+        booking = (
+            await session.scalar(
+                select(Booking).where(Booking.contact_id == conversation.contact_id)
+            )
+            if conversation is not None
+            else None
+        )
         assert conversation is not None
         assert booking is not None
         assert booking.status is BookingStatus.CANCELLED
@@ -1168,9 +1169,13 @@ async def test_confirm_create_final_busy_cancels_reserved_local_intent(session_f
     assert calendar.mutation_calls == []
     async with session_factory() as session:
         conversation = await session.get(Conversation, conversation_id)
-        booking = await session.scalar(
-            select(Booking).where(Booking.contact_id == conversation.contact_id)
-        ) if conversation is not None else None
+        booking = (
+            await session.scalar(
+                select(Booking).where(Booking.contact_id == conversation.contact_id)
+            )
+            if conversation is not None
+            else None
+        )
         assert conversation is not None
         assert booking is not None
         assert booking.status is BookingStatus.CANCELLED
@@ -1266,9 +1271,7 @@ async def test_confirm_create_recovers_after_crash_following_provider_success(
             select(Booking).where(Booking.contact_id == conversation.contact_id)
         )
         execution = await session.scalar(
-            select(ToolExecution).where(
-                ToolExecution.idempotency_key == request.idempotency_key
-            )
+            select(ToolExecution).where(ToolExecution.idempotency_key == request.idempotency_key)
         )
         assert booking is not None
         assert execution is not None
@@ -1288,9 +1291,7 @@ async def test_confirm_create_recovers_after_crash_following_provider_success(
         assert booking is not None
         assert booking.status is BookingStatus.CONFIRMED
         execution = await session.scalar(
-            select(ToolExecution).where(
-                ToolExecution.idempotency_key == request.idempotency_key
-            )
+            select(ToolExecution).where(ToolExecution.idempotency_key == request.idempotency_key)
         )
         assert execution is not None
         assert execution.status is ToolExecutionStatus.SUCCEEDED
@@ -1598,9 +1599,7 @@ async def test_concurrent_same_key_confirmations_create_one_booking_and_event(
 
     assert sum(isinstance(result, ConfirmationResult) for result in results) == 2
     assert sum(getattr(result, "replayed", False) for result in results) == 1
-    assert calendar.mutation_calls == [
-        ("create", CALENDAR_ID, calendar.mutation_calls[0][2])
-    ]
+    assert calendar.mutation_calls == [("create", CALENDAR_ID, calendar.mutation_calls[0][2])]
     async with session_factory() as session:
         conversation = await session.get(Conversation, conversation_id)
         assert conversation is not None
@@ -1670,9 +1669,7 @@ async def test_concurrent_exact_duplicate_creates_share_contact_without_deadlock
     async with session_factory() as session:
         assert (
             await session.scalar(
-                select(func.count())
-                .select_from(Booking)
-                .where(Booking.contact_id == contact_id)
+                select(func.count()).select_from(Booking).where(Booking.contact_id == contact_id)
             )
             == 1
         )
