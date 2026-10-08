@@ -27,11 +27,23 @@ class DeterministicCalendarDouble:
         busy_intervals: Iterable[CalendarBusyInterval | CalendarInterval] = (),
         free_busy_error: CalendarClientError | None = None,
         ambiguous_create_event_ids: set[str] | None = None,
+        ambiguous_create_before_success: bool = False,
+        ambiguous_create_after_success: bool = False,
+        foreign_marker_event_ids: set[str] | None = None,
+        foreign_marker: bool = False,
+        ambiguous_patch_after_success: bool = False,
+        ambiguous_cancel_after_success: bool = False,
     ) -> None:
         self.calendar_id = calendar_id
         self._busy_intervals = tuple(busy_intervals)
         self._free_busy_error = free_busy_error
         self._ambiguous_create_event_ids = ambiguous_create_event_ids or set()
+        self._ambiguous_create_before_success = ambiguous_create_before_success
+        self._ambiguous_create_after_success = ambiguous_create_after_success
+        self._foreign_marker_event_ids = foreign_marker_event_ids or set()
+        self._foreign_marker = foreign_marker
+        self._ambiguous_patch_after_success = ambiguous_patch_after_success
+        self._ambiguous_cancel_after_success = ambiguous_cancel_after_success
         self._events: dict[tuple[str, str], CalendarEventSnapshot] = {}
         self._etag_counter = 0
         self.free_busy_queries: list[tuple[str, datetime, datetime]] = []
@@ -86,6 +98,13 @@ class DeterministicCalendarDouble:
     ) -> CalendarEventSnapshot:
         self.mutation_calls.append(("create", calendar_id, event_id))
         key = (calendar_id, event_id)
+        if self._ambiguous_create_before_success:
+            self._ambiguous_create_before_success = False
+            raise CalendarClientError(
+                CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED,
+                "Calendar write result requires reconciliation",
+                retryable=True,
+            )
         if key in self._events:
             raise CalendarClientError(
                 CalendarErrorCode.EXTERNAL_STATE_CONFLICT,
@@ -95,11 +114,16 @@ class DeterministicCalendarDouble:
             calendar_id=calendar_id,
             event_id=event_id,
             interval=event.interval,
-            private_booking_id=event.private_booking_id,
+            private_booking_id=(
+                "foreign-booking"
+                if self._foreign_marker or event_id in self._foreign_marker_event_ids
+                else event.private_booking_id
+            ),
             etag=self._next_etag(),
         )
         self._events[key] = snapshot
-        if event_id in self._ambiguous_create_event_ids:
+        if event_id in self._ambiguous_create_event_ids or self._ambiguous_create_after_success:
+            self._ambiguous_create_after_success = False
             raise CalendarClientError(
                 CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED,
                 "Calendar write result requires reconciliation",
@@ -135,6 +159,13 @@ class DeterministicCalendarDouble:
             etag=self._next_etag(),
         )
         self._events[(calendar_id, event_id)] = updated
+        if self._ambiguous_patch_after_success:
+            self._ambiguous_patch_after_success = False
+            raise CalendarClientError(
+                CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED,
+                "Calendar write result requires reconciliation",
+                retryable=True,
+            )
         return updated
 
     async def cancel_event(self, calendar_id: str, event_id: str, if_match_etag: str) -> None:
@@ -149,3 +180,10 @@ class DeterministicCalendarDouble:
                 retryable=True,
             )
         del self._events[(calendar_id, event_id)]
+        if self._ambiguous_cancel_after_success:
+            self._ambiguous_cancel_after_success = False
+            raise CalendarClientError(
+                CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED,
+                "Calendar write result requires reconciliation",
+                retryable=True,
+            )

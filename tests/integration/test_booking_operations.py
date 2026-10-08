@@ -11,11 +11,15 @@ from receptionist.application.booking import (
     BookingErrorCode,
     BookingErrorResult,
     CancelBookingRequest,
+    ConfirmationResult,
+    ConfirmBookingActionRequest,
     CreateBookingRequest,
     PreparationResult,
     RescheduleBookingRequest,
     ToolExecutionClaimOutcome,
     _claim_tool_execution,
+    _deterministic_calendar_event_id,
+    confirm_booking_action,
     prepare_cancel_booking,
     prepare_create_booking,
     prepare_reschedule_booking,
@@ -34,6 +38,8 @@ from receptionist.domain.enums import (
     ConversationChannel,
     ConversationLanguageMode,
     ConversationStatus,
+    PendingActionStatus,
+    PendingActionType,
     ToolExecutionStatus,
 )
 from receptionist.integrations.google_calendar import (
@@ -921,3 +927,295 @@ async def test_prepare_operations_never_call_calendar_mutation_methods(session_f
         now_utc=NOW_UTC,
     )
     assert calendar.mutation_calls == []
+
+
+def test_deterministic_calendar_event_id_is_stable_and_google_safe() -> None:
+    booking_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+
+    event_id = _deterministic_calendar_event_id(booking_id)
+
+    assert event_id == _deterministic_calendar_event_id(booking_id)
+    assert event_id.startswith("receptionist-booking-")
+    assert len(event_id) <= 1024
+    assert all(
+        character.islower() or character.isdigit() or character in "-_"
+        for character in event_id
+    )
+    assert str(booking_id) not in event_id
+
+
+async def test_confirm_create_reconciles_booking_and_clears_action(session_factory) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double()
+    preparation = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"prepare-confirm-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+    assert calendar.mutation_calls == []
+    confirmation_key = f"confirm-create-{uuid.uuid4()}"
+
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=preparation.data.action_type,
+            action_token=preparation.data.action_token,
+            idempotency_key=confirmation_key,
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, ConfirmationResult)
+    assert result.data.status is BookingStatus.CONFIRMED
+    assert len(calendar.mutation_calls) == 1
+    async with session_factory() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        execution = await session.scalar(
+            select(ToolExecution).where(ToolExecution.idempotency_key == confirmation_key)
+        )
+        booking = await session.scalar(
+            select(Booking).where(Booking.contact_id == conversation.contact_id)
+        ) if conversation is not None else None
+        audits = (
+            await session.scalars(
+                select(AuditEvent).where(AuditEvent.conversation_id == conversation_id)
+            )
+        ).all()
+        assert conversation is not None
+        assert execution is not None
+        assert booking is not None
+        assert execution.status is ToolExecutionStatus.SUCCEEDED
+        assert booking.status is BookingStatus.CONFIRMED
+        assert booking.calendar_id == CALENDAR_ID
+        assert booking.calendar_event_id == result.data.calendar_event_id
+        assert conversation.pending_action_type is None
+        assert conversation.pending_action_payload is None
+        assert audits
+        event = await calendar.get_event(CALENDAR_ID, booking.calendar_event_id)
+        assert event is not None
+        assert event.private_booking_id == str(booking.id)
+
+
+async def test_confirm_create_same_key_replays_without_second_calendar_event(
+    session_factory,
+) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double()
+    preparation = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"prepare-replay-confirm-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+    request = ConfirmBookingActionRequest(
+        conversation_id=conversation_id,
+        action_type=preparation.data.action_type,
+        action_token=preparation.data.action_token,
+        idempotency_key=f"confirm-replay-{uuid.uuid4()}",
+    )
+
+    first = await confirm_booking_action(
+        session_factory, calendar, request, now_utc=NOW_UTC
+    )
+    replay = await confirm_booking_action(
+        session_factory, calendar, request, now_utc=NOW_UTC
+    )
+
+    assert isinstance(first, ConfirmationResult)
+    assert isinstance(replay, ConfirmationResult)
+    assert replay.replayed is True
+    assert replay.data == first.data
+    assert [call[0] for call in calendar.mutation_calls] == ["create"]
+
+
+@pytest.mark.parametrize(
+    "action_type,action_token",
+    [
+        (PendingActionType.CREATE_BOOKING, "wrong-token"),
+        (PendingActionType.CANCEL_BOOKING, "wrong-token"),
+    ],
+)
+async def test_confirm_mismatch_preserves_current_action_and_never_mutates_calendar(
+    session_factory, action_type: PendingActionType, action_token: str
+) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double()
+    preparation = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"prepare-mismatch-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+    key = f"confirm-mismatch-{uuid.uuid4()}"
+    request = ConfirmBookingActionRequest(
+        conversation_id=conversation_id,
+        action_type=action_type,
+        action_token=action_token,
+        idempotency_key=key,
+    )
+
+    result = await confirm_booking_action(session_factory, calendar, request, now_utc=NOW_UTC)
+    replay = await confirm_booking_action(session_factory, calendar, request, now_utc=NOW_UTC)
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.STALE_PENDING_ACTION
+    assert isinstance(replay, BookingErrorResult)
+    assert isinstance(replay, BookingErrorResult)
+    assert replay.error == result.error
+    assert calendar.mutation_calls == []
+    async with session_factory() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        execution = await session.scalar(
+            select(ToolExecution).where(ToolExecution.idempotency_key == key)
+        )
+        assert conversation is not None
+        assert execution is not None
+        assert conversation.pending_action_type is PendingActionType.CREATE_BOOKING
+        assert conversation.pending_action_status is PendingActionStatus.AWAITING_CONFIRMATION
+        assert conversation.pending_action_payload is not None
+        assert conversation.pending_action_payload["action_token"] == preparation.data.action_token
+        assert execution.status is ToolExecutionStatus.REJECTED
+
+
+async def test_confirm_create_existing_event_with_foreign_marker_is_not_adopted(
+    session_factory,
+) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double(foreign_marker=True)
+    preparation = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"prepare-foreign-marker-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=preparation.data.action_type,
+            action_token=preparation.data.action_token,
+            idempotency_key=f"confirm-foreign-marker-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.EXTERNAL_STATE_CONFLICT
+    async with session_factory() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        booking = await session.scalar(
+            select(Booking).where(Booking.contact_id == conversation.contact_id)
+        ) if conversation is not None else None
+        assert conversation is not None
+        assert booking is not None
+        assert booking.status is BookingStatus.CANCELLED
+        event = await calendar.get_event(CALENDAR_ID, booking.calendar_event_id)
+        assert event is not None
+        assert event.private_booking_id == "foreign-booking"
+
+
+async def test_confirm_create_final_busy_cancels_reserved_local_intent(session_factory) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double()
+    preparation = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"prepare-busy-confirm-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+    calendar._busy_intervals = (CalendarInterval(REQUESTED_START, REQUESTED_END),)
+
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=preparation.data.action_type,
+            action_token=preparation.data.action_token,
+            idempotency_key=f"confirm-busy-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.CALENDAR_INTERVAL_UNAVAILABLE
+    assert calendar.mutation_calls == []
+    async with session_factory() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        booking = await session.scalar(
+            select(Booking).where(Booking.contact_id == conversation.contact_id)
+        ) if conversation is not None else None
+        assert conversation is not None
+        assert booking is not None
+        assert booking.status is BookingStatus.CANCELLED
+        assert booking.calendar_id is None
+        assert booking.calendar_event_id is None
+        assert conversation.pending_action_type is None
+
+
+async def test_confirm_create_ambiguous_missing_event_retries_same_event_id(
+    session_factory,
+) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double(ambiguous_create_before_success=True)
+    preparation = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"prepare-ambiguous-missing-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=preparation.data.action_type,
+            action_token=preparation.data.action_token,
+            idempotency_key=f"confirm-ambiguous-missing-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, ConfirmationResult)
+    assert len(calendar.mutation_calls) == 2
+    assert calendar.mutation_calls[0] == calendar.mutation_calls[1]
+
+
+async def test_confirm_create_ambiguous_provider_success_reconciles_one_event(
+    session_factory,
+) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double(ambiguous_create_after_success=True)
+    preparation = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"prepare-ambiguous-success-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+    request = ConfirmBookingActionRequest(
+        conversation_id=conversation_id,
+        action_type=preparation.data.action_type,
+        action_token=preparation.data.action_token,
+        idempotency_key=f"confirm-ambiguous-success-{uuid.uuid4()}",
+    )
+
+    first = await confirm_booking_action(session_factory, calendar, request, now_utc=NOW_UTC)
+    replay = await confirm_booking_action(session_factory, calendar, request, now_utc=NOW_UTC)
+
+    assert isinstance(first, ConfirmationResult)
+    assert isinstance(replay, ConfirmationResult)
+    assert replay.replayed is True
+    assert len(calendar.mutation_calls) == 1

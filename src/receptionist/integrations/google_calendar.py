@@ -35,6 +35,11 @@ class CalendarErrorCode(StrEnum):
     CALENDAR_RECONCILIATION_REQUIRED = "calendar_reconciliation_required"
 
 
+class CalendarEventLifecycle(StrEnum):
+    ACTIVE = "active"
+    CANCELLED = "cancelled"
+
+
 class CalendarClientError(Exception):
     """A bounded integration error that does not expose provider details."""
 
@@ -103,6 +108,7 @@ class CalendarEventSnapshot:
     interval: CalendarInterval
     private_booking_id: str | None
     etag: str
+    lifecycle: CalendarEventLifecycle = CalendarEventLifecycle.ACTIVE
 
 
 @dataclass(frozen=True)
@@ -550,6 +556,11 @@ def _event_snapshot(event: Mapping[str, Any], calendar_id: str) -> CalendarEvent
         interval=interval,
         private_booking_id=private_booking_id,
         etag=etag,
+        lifecycle=(
+            CalendarEventLifecycle.CANCELLED
+            if event.get("status") == "cancelled"
+            else CalendarEventLifecycle.ACTIVE
+        ),
     )
 
 
