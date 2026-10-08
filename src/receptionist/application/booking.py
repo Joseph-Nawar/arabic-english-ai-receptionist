@@ -2212,11 +2212,14 @@ async def prepare_create_booking(
         replay = _replay_claim(claim, operation)
         if replay is not None:
             return replay
-        conversation = await session.scalar(
-            select(Conversation).where(Conversation.id == request.conversation_id).with_for_update()
+        business_row, conversation, contact, _ = await _lock_ordered_rows(
+            session,
+            conversation_id=request.conversation_id,
         )
         if conversation is None:
-            raise RuntimeError("conversation disappeared while locked")
+            return _booking_error_result(operation, BookingErrorCode.INVALID_INPUT)
+        if contact is None:
+            return _booking_error_result(operation, BookingErrorCode.INVALID_INPUT)
         if conversation.pending_action_type is not None:
             result = _booking_error_result(operation, BookingErrorCode.PENDING_ACTION_CONFLICT)
             _terminalize_execution(
@@ -2228,7 +2231,6 @@ async def prepare_create_booking(
             )
             return result
 
-        business_row = await session.get(BusinessConfig, 1)
         if business_row is None:
             result = _booking_error_result(operation, BookingErrorCode.CONFIGURATION_CONFLICT)
             _terminalize_execution(
@@ -2428,11 +2430,15 @@ async def prepare_reschedule_booking(
         replay = _replay_claim(claim, operation)
         if replay is not None:
             return replay
-        conversation = await session.scalar(
-            select(Conversation).where(Conversation.id == request.conversation_id).with_for_update()
+        business_row, conversation, contact, booking = await _lock_ordered_rows(
+            session,
+            conversation_id=request.conversation_id,
+            booking_id=request.booking_id,
         )
         if conversation is None:
-            raise RuntimeError("conversation disappeared while locked")
+            return _booking_error_result(operation, BookingErrorCode.INVALID_INPUT)
+        if contact is None:
+            return _booking_error_result(operation, BookingErrorCode.INVALID_INPUT)
         if conversation.pending_action_type is not None:
             result = _booking_error_result(operation, BookingErrorCode.PENDING_ACTION_CONFLICT)
             _terminalize_execution(
@@ -2443,10 +2449,7 @@ async def prepare_reschedule_booking(
                 finished_at=now,
             )
             return result
-        booking = await session.scalar(
-            select(Booking).where(Booking.id == request.booking_id).with_for_update()
-        )
-        if booking is None or booking.contact_id != conversation.contact_id:
+        if booking is None or booking.contact_id != contact.id:
             result = _booking_error_result(operation, BookingErrorCode.BOOKING_NOT_FOUND)
             _terminalize_execution(
                 session,
@@ -2481,7 +2484,6 @@ async def prepare_reschedule_booking(
                 finished_at=now,
             )
             return result
-        business_row = await session.get(BusinessConfig, 1)
         service = await session.get(Service, booking.service_id)
         if business_row is None or service is None:
             result = _booking_error_result(operation, BookingErrorCode.CONFIGURATION_CONFLICT)
@@ -2632,11 +2634,25 @@ async def prepare_cancel_booking(
         replay = _replay_claim(claim, operation)
         if replay is not None:
             return replay
-        conversation = await session.scalar(
-            select(Conversation).where(Conversation.id == request.conversation_id).with_for_update()
+        business_row, conversation, contact, booking = await _lock_ordered_rows(
+            session,
+            conversation_id=request.conversation_id,
+            booking_id=request.booking_id,
         )
         if conversation is None:
-            raise RuntimeError("conversation disappeared while locked")
+            return _booking_error_result(operation, BookingErrorCode.INVALID_INPUT)
+        if contact is None:
+            return _booking_error_result(operation, BookingErrorCode.INVALID_INPUT)
+        if business_row is None:
+            result = _booking_error_result(operation, BookingErrorCode.CONFIGURATION_CONFLICT)
+            _terminalize_execution(
+                session,
+                conversation=conversation,
+                execution=claim.execution,
+                result=result,
+                finished_at=now,
+            )
+            return result
         if conversation.pending_action_type is not None:
             result = _booking_error_result(operation, BookingErrorCode.PENDING_ACTION_CONFLICT)
             _terminalize_execution(
@@ -2647,10 +2663,7 @@ async def prepare_cancel_booking(
                 finished_at=now,
             )
             return result
-        booking = await session.scalar(
-            select(Booking).where(Booking.id == request.booking_id).with_for_update()
-        )
-        if booking is None or booking.contact_id != conversation.contact_id:
+        if booking is None or booking.contact_id != contact.id:
             result = _booking_error_result(operation, BookingErrorCode.BOOKING_NOT_FOUND)
             _terminalize_execution(
                 session,
