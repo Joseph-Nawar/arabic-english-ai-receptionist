@@ -6,7 +6,7 @@ This is the approved 13-phase roadmap for the Arabic-English AI Receptionist & C
 | --- | --- | --- |
 | 0 | Engineering Foundation & Architecture | `COMPLETE` |
 | 1 | Business Domain, Identity & State | `COMPLETE` |
-| 2 | Booking & Deterministic Business Tools | `IN PROGRESS` |
+| 2 | Booking & Deterministic Business Tools | `REVIEW` |
 | 3 | HubSpot CRM Integration | `NOT STARTED` |
 | 4 | Conversational Core & Text Evaluation Baseline | `NOT STARTED` |
 | 5 | WhatsApp Text & Voice Notes | `NOT STARTED` |
@@ -18,4 +18,4 @@ This is the approved 13-phase roadmap for the Arabic-English AI Receptionist & C
 | 11 | Multilingual System Evaluation & Release Gates | `NOT STARTED` |
 | 12 | Portfolio & Freelance Release | `NOT STARTED` |
 
-Phase 0 was independently reviewed and approved as `COMPLETE`. Phase 1 was completed after independent review and remediation and is now `COMPLETE`. Phase 2 is currently `IN PROGRESS` for design only; implementation has not started. Phases 3–12 remain `NOT STARTED`.
+Phase 0 was independently reviewed and approved as `COMPLETE`. Phase 1 was completed after independent review and remediation and is now `COMPLETE`. Phase 2 implementation candidate is complete and pending independent review and human approval; it remains `REVIEW` until that approval. Phase 3 HubSpot and Phases 4–12 remain `NOT STARTED`.

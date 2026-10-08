@@ -34,7 +34,7 @@ The reproducible local loop uses host Python/uv for FastAPI and Docker Compose o
    git status --short --ignored .env
    ```
 
-6. Start the development database, apply the current Phase 1 Alembic schema, seed the synthetic reference catalog, and run the web process on the host:
+6. Start the development database, apply the current Phase 2 Alembic schema, seed the synthetic reference catalog, and run the web process on the host:
 
    ```sh
    make db-up
@@ -51,6 +51,13 @@ The reproducible local loop uses host Python/uv for FastAPI and Docker Compose o
    ```
 
 The application does not run migrations automatically at startup. Stop infrastructure with `make db-down` when finished. The isolated test database uses `make test-db-up`, port `55432`, and database name `receptionist_test`; use `make test-db-down` to stop it. The reference seed is synthetic/demo-only and refuses the `production` environment.
+
+Runtime Google Calendar settings are optional for ordinary startup and provider-free tests. When enabled, configure one writable Calendar plus an OAuth authorized-user refresh token provisioned out of band with exactly these scopes:
+
+- `https://www.googleapis.com/auth/calendar.events`
+- `https://www.googleapis.com/auth/calendar.freebusy`
+
+There is no application OAuth consent UI, browser flow, credential bootstrap, or credential file persistence. Keep all credential values out of `.env.example`, Git, logs, and exceptions.
 
 ## Optional dedicated Calendar smoke
 
