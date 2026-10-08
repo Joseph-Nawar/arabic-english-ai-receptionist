@@ -67,10 +67,7 @@ typecheck:
 	$(UV) run mypy src
 
 secrets:
-	@baseline_copy=$$(mktemp); \
-	cp .secrets.baseline "$$baseline_copy"; \
-	trap 'rm -f "$$baseline_copy"' EXIT; \
-	git ls-files -co --exclude-standard -z | xargs -0 $(UV) run detect-secrets-hook --baseline "$$baseline_copy" --exclude-files '^\.secrets\.baseline$$'
+	git ls-files -co --exclude-standard -z | xargs -0 $(UV) run detect-secrets-hook --baseline .secrets.baseline --exclude-files '^\.secrets\.baseline$$'
 
 audit:
 	$(UV) run pip-audit
