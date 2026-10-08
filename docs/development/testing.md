@@ -60,6 +60,8 @@ make seed
 
 Booking is provider-independent in Phase 1 and has no Calendar identifiers or provider calls. ToolExecution, ProviderEventReceipt, and OutboxEvent are persistence/state primitives only: there is no tool dispatcher, outbox publisher, provider adapter, webhook handler, workflow engine, or external provider call in this phase.
 
+Phase 2 automated tests remain provider-free. The deterministic Calendar double covers the booking operation and recovery paths, PostgreSQL integration tests cover durable concurrency and transaction behavior, and the shared `httplib2` guard blocks accidental live Calendar network access. `make migration-check` and `make alembic-verify` cover migration drift and the guarded upgrade → downgrade → upgrade cycle. The separate `make calendar-smoke` command is a manual, explicitly guarded check against a dedicated non-production Calendar only; it is never part of CI or normal verification. If dedicated credentials are unavailable, report `not run: dedicated Calendar credentials unavailable`.
+
 The destructive migration cycle remains protected by `assert_safe_test_database`; it refuses non-test environments and any database name other than `receptionist_test`. The seed command is a thin invocation of the synthetic reference seed and has its own production refusal.
 
 ## Quality and security

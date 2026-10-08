@@ -51,3 +51,20 @@ The reproducible local loop uses host Python/uv for FastAPI and Docker Compose o
    ```
 
 The application does not run migrations automatically at startup. Stop infrastructure with `make db-down` when finished. The isolated test database uses `make test-db-up`, port `55432`, and database name `receptionist_test`; use `make test-db-down` to stop it. The reference seed is synthetic/demo-only and refuses the `production` environment.
+
+## Optional dedicated Calendar smoke
+
+Phase 2 includes a manual-only Calendar smoke path for a dedicated non-production Calendar. It is never part of application startup, normal tests, `make check`, `make verify`, or CI. Provision an OAuth authorized-user refresh token out of band with exactly these least-privilege scopes:
+
+- `https://www.googleapis.com/auth/calendar.events`
+- `https://www.googleapis.com/auth/calendar.freebusy`
+
+The application does not provide an OAuth consent UI or write credentials to disk. Set the existing Google credential variables plus `RECEPTIONIST_APP_ENV=test` (or another non-production environment), `RECEPTIONIST_CALENDAR_SMOKE_ENV=synthetic`, `RECEPTIONIST_CALENDAR_SMOKE_CONFIRM=DEDICATED_NON_PRODUCTION_ONLY`, and a dedicated Calendar ID beginning with `smoke-` in `RECEPTIONIST_CALENDAR_SMOKE_CALENDAR_ID`. The smoke ID is required separately; it never falls back to `RECEPTIONIST_GOOGLE_CALENDAR_ID`.
+
+Run only when the dedicated Calendar and credentials are intentionally provisioned:
+
+```sh
+make calendar-smoke
+```
+
+The guarded flow uses synthetic local records and the existing booking operations, and cleanup targets only the exact deterministic event created by that run. If credentials are unavailable, record `not run: dedicated Calendar credentials unavailable`; do not substitute a live customer Calendar or claim a smoke pass.

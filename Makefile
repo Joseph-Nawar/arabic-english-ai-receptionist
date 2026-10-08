@@ -5,7 +5,7 @@ TEST_DATABASE_URL ?= postgresql+psycopg://receptionist:receptionist@localhost:55
 .PHONY: install dev db-up db-down test-db-up test-db-down migrate migration \
 	migration-check seed test test-unit \
 	test-integration lint format format-check typecheck secrets audit security \
-	alembic-verify docker-config docker-build check verify
+	alembic-verify docker-config docker-build calendar-smoke check verify
 
 install:
 	$(UV) sync --all-groups --frozen
@@ -76,6 +76,9 @@ audit:
 	$(UV) run pip-audit
 
 security: lint secrets audit
+
+calendar-smoke:
+	$(UV) run python scripts/calendar_smoke.py
 
 docker-config:
 	docker compose config
