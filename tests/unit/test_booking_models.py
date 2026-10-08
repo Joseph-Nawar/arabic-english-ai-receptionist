@@ -18,15 +18,14 @@ from receptionist.application.booking import (
     GetBookingRequest,
     PreparationData,
     PreparationResult,
-    generate_action_token,
-    pending_action_matches,
     RescheduleBookingRequest,
     ServiceAreaLookupRequest,
     ServiceLookupRequest,
+    generate_action_token,
+    pending_action_matches,
 )
-from receptionist.domain.enums import BookingStatus, PendingActionType
+from receptionist.domain.enums import BookingStatus, PendingActionStatus, PendingActionType
 from receptionist.domain.state import PendingActionState
-from receptionist.domain.enums import PendingActionStatus
 
 pytestmark = pytest.mark.unit
 
