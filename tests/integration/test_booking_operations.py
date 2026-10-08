@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func, select
 
 from receptionist.application import booking as booking_application
@@ -922,6 +923,33 @@ async def test_get_booking_bounds_provider_read_failure_and_uses_persisted_ident
     assert result.error.retryable is True
     assert "provider response" not in result.model_dump_json()
     assert calendar.get_event_calls == [(CALENDAR_ID, event_id)]
+
+
+async def test_expected_constraint_conflict_is_rolled_back_before_session_reuse(
+    session_factory,
+) -> None:
+    contact_id, _, service_id = await _operation_context(session_factory)
+    first_booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    async with session_factory() as session:
+        first = await session.get(Booking, first_booking_id)
+        assert first is not None
+        duplicate = Booking(
+            contact_id=contact_id,
+            service_id=service_id,
+            status=BookingStatus.PENDING,
+            start_at=REQUESTED_START,
+            end_at=REQUESTED_END,
+            calendar_id=first.calendar_id,
+            calendar_event_id=first.calendar_event_id,
+            booking_data=_booking_data(),
+        )
+        session.add(duplicate)
+        with pytest.raises(IntegrityError):
+            await session.flush()
+        await session.rollback()
+        assert await session.get(Booking, first_booking_id) is not None
 
 
 async def _booking_event_id(session_factory, booking_id: uuid.UUID) -> str:
