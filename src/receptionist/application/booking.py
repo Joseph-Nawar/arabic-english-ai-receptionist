@@ -437,6 +437,29 @@ def _claim_matches(
     )
 
 
+def _claim_existing_execution(
+    execution: ToolExecution,
+    *,
+    conversation_id: UUID,
+    tool_name: str,
+    arguments_fingerprint: str,
+) -> ToolExecutionClaim:
+    if not _claim_matches(
+        execution,
+        conversation_id=conversation_id,
+        tool_name=tool_name,
+        arguments_fingerprint=arguments_fingerprint,
+    ):
+        return ToolExecutionClaim(ToolExecutionClaimOutcome.IDEMPOTENCY_CONFLICT, execution)
+    outcomes = {
+        ToolExecutionStatus.SUCCEEDED: ToolExecutionClaimOutcome.SUCCEEDED_REPLAY,
+        ToolExecutionStatus.REJECTED: ToolExecutionClaimOutcome.REJECTED_REPLAY,
+        ToolExecutionStatus.FAILED: ToolExecutionClaimOutcome.FAILED_REPLAY,
+        ToolExecutionStatus.STARTED: ToolExecutionClaimOutcome.STARTED_RECOVERY,
+    }
+    return ToolExecutionClaim(outcomes[execution.status], execution)
+
+
 async def _claim_tool_execution(
     session: AsyncSession,
     *,
@@ -447,6 +470,19 @@ async def _claim_tool_execution(
 ) -> ToolExecutionClaim:
     """Claim one booking execution key with PostgreSQL conflict-safe insertion."""
     arguments_fingerprint = _arguments_fingerprint(sanitized_arguments)
+    existing = await session.scalar(
+        select(ToolExecution)
+        .where(ToolExecution.idempotency_key == idempotency_key)
+        .with_for_update()
+    )
+    if existing is not None:
+        return _claim_existing_execution(
+            existing,
+            conversation_id=conversation_id,
+            tool_name=tool_name,
+            arguments_fingerprint=arguments_fingerprint,
+        )
+
     active_execution = await session.scalar(
         select(ToolExecution)
         .where(
@@ -483,20 +519,12 @@ async def _claim_tool_execution(
     )
     if existing is None:
         raise RuntimeError("idempotency claim disappeared after conflict")
-    if not _claim_matches(
+    return _claim_existing_execution(
         existing,
         conversation_id=conversation_id,
         tool_name=tool_name,
         arguments_fingerprint=arguments_fingerprint,
-    ):
-        return ToolExecutionClaim(ToolExecutionClaimOutcome.IDEMPOTENCY_CONFLICT, existing)
-    outcomes = {
-        ToolExecutionStatus.SUCCEEDED: ToolExecutionClaimOutcome.SUCCEEDED_REPLAY,
-        ToolExecutionStatus.REJECTED: ToolExecutionClaimOutcome.REJECTED_REPLAY,
-        ToolExecutionStatus.FAILED: ToolExecutionClaimOutcome.FAILED_REPLAY,
-        ToolExecutionStatus.STARTED: ToolExecutionClaimOutcome.STARTED_RECOVERY,
-    }
-    return ToolExecutionClaim(outcomes[existing.status], existing)
+    )
 
 
 _ERROR_MESSAGES = {
@@ -649,10 +677,8 @@ def _resolve_area(
 
 
 def _calendar_id(calendar: CalendarClient) -> str | None:
-    value = getattr(calendar, "calendar_id", None)
-    if isinstance(value, str) and value.strip():
-        return value
-    return None
+    value = calendar.calendar_id
+    return value if value.strip() else None
 
 
 def _policy_error(decision: PolicyDecision) -> BookingErrorCode | None:
@@ -678,15 +704,7 @@ def _availability_error(decision: AvailabilityDecision) -> BookingErrorCode | No
 def _safe_cancellation_context(value: str | None) -> str | None:
     if value is None:
         return None
-    normalized = " ".join(value.split())
-    if any(
-        marker in normalized.casefold()
-        for marker in ("@", "phone", "email", "address", "transcript")
-    ):
-        return "provided"
-    if any(character.isdigit() for character in normalized):
-        return "provided"
-    return normalized
+    return "provided" if value.strip() else None
 
 
 def _pending_payload(

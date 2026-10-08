@@ -128,6 +128,9 @@ class CalendarEventPatch:
 
 
 class CalendarClient(Protocol):
+    @property
+    def calendar_id(self) -> str: ...
+
     async def query_free_busy(
         self, calendar_id: str, time_min: datetime, time_max: datetime
     ) -> tuple[CalendarBusyInterval, ...]: ...

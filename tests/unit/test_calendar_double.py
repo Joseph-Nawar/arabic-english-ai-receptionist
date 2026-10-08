@@ -9,6 +9,7 @@ from receptionist.application.booking import check_calendar_availability
 from receptionist.domain.booking_policy import PolicyDecision, RequestedInterval
 from receptionist.integrations.google_calendar import (
     CalendarBusyInterval,
+    CalendarClient,
     CalendarClientError,
     CalendarErrorCode,
     CalendarEventCreate,
@@ -63,6 +64,13 @@ async def test_calendar_double_supports_free_busy_event_crud_and_etags() -> None
 
     await double.cancel_event(CALENDAR_ID, "event-id", patched.etag)
     assert await double.get_event(CALENDAR_ID, "event-id") is None
+
+
+def test_calendar_double_exposes_configured_calendar_id_contract() -> None:
+    double = DeterministicCalendarDouble(calendar_id=CALENDAR_ID)
+    client: CalendarClient = double
+
+    assert client.calendar_id == CALENDAR_ID
 
 
 async def test_calendar_double_supports_busy_and_conflict_reads() -> None:

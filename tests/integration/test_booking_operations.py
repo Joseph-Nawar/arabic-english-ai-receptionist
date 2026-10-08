@@ -99,9 +99,7 @@ async def _operation_context(session_factory) -> tuple[uuid.UUID, uuid.UUID, uui
 
 
 def _calendar_double(**kwargs) -> DeterministicCalendarDouble:
-    calendar = DeterministicCalendarDouble(**kwargs)
-    calendar.calendar_id = CALENDAR_ID
-    return calendar
+    return DeterministicCalendarDouble(calendar_id=CALENDAR_ID, **kwargs)
 
 
 def _create_request(conversation_id: uuid.UUID, key: str) -> CreateBookingRequest:
@@ -224,6 +222,139 @@ async def test_terminal_tool_execution_claims_replay_stored_result(
         )
         assert replay.outcome is outcome
         assert replay.execution.sanitized_result == {"ok": status is ToolExecutionStatus.SUCCEEDED}
+
+
+@pytest.mark.parametrize(
+    "status,outcome",
+    [
+        (ToolExecutionStatus.SUCCEEDED, ToolExecutionClaimOutcome.SUCCEEDED_REPLAY),
+        (ToolExecutionStatus.REJECTED, ToolExecutionClaimOutcome.REJECTED_REPLAY),
+        (ToolExecutionStatus.FAILED, ToolExecutionClaimOutcome.FAILED_REPLAY),
+    ],
+)
+async def test_exact_terminal_key_replays_before_unrelated_started_execution(
+    session_factory, status: ToolExecutionStatus, outcome: ToolExecutionClaimOutcome
+) -> None:
+    (conversation_id,) = await _conversation_ids(session_factory)
+    terminal_key = f"terminal-priority-{uuid.uuid4()}"
+    active_key = f"active-unrelated-{uuid.uuid4()}"
+    arguments = {"booking_id": "booking-id"}
+
+    async with session_factory.begin() as session:
+        terminal = await _claim_tool_execution(
+            session,
+            conversation_id=conversation_id,
+            tool_name="prepare_cancel_booking",
+            idempotency_key=terminal_key,
+            sanitized_arguments=arguments,
+        )
+        terminal.execution.status = status
+        terminal.execution.sanitized_result = {"status": status.value}
+        terminal.execution.safe_error_code = (
+            "booking_state_conflict" if status is not ToolExecutionStatus.SUCCEEDED else None
+        )
+        terminal.execution.finished_at = datetime.now(UTC)
+
+    async with session_factory.begin() as session:
+        active = await _claim_tool_execution(
+            session,
+            conversation_id=conversation_id,
+            tool_name="prepare_cancel_booking",
+            idempotency_key=active_key,
+            sanitized_arguments=arguments,
+        )
+        assert active.outcome is ToolExecutionClaimOutcome.NEW
+
+    async with session_factory.begin() as session:
+        replay = await _claim_tool_execution(
+            session,
+            conversation_id=conversation_id,
+            tool_name="prepare_cancel_booking",
+            idempotency_key=terminal_key,
+            sanitized_arguments=arguments,
+        )
+
+    assert replay.outcome is outcome
+    assert replay.execution.sanitized_result == {"status": status.value}
+
+
+async def test_exact_started_key_recovers_before_unrelated_started_execution(
+    session_factory,
+) -> None:
+    (conversation_id,) = await _conversation_ids(session_factory)
+    requested_key = f"started-priority-{uuid.uuid4()}"
+    unrelated_key = f"started-unrelated-{uuid.uuid4()}"
+    arguments = {"booking_id": "booking-id"}
+
+    async with session_factory.begin() as session:
+        requested = await _claim_tool_execution(
+            session,
+            conversation_id=conversation_id,
+            tool_name="confirm_booking_action",
+            idempotency_key=requested_key,
+            sanitized_arguments=arguments,
+        )
+        assert requested.outcome is ToolExecutionClaimOutcome.NEW
+        session.add(
+            ToolExecution(
+                conversation_id=conversation_id,
+                tool_name="confirm_booking_action",
+                status=ToolExecutionStatus.STARTED,
+                idempotency_key=unrelated_key,
+                sanitized_arguments=arguments,
+            )
+        )
+
+    async with session_factory.begin() as session:
+        recovery = await _claim_tool_execution(
+            session,
+            conversation_id=conversation_id,
+            tool_name="confirm_booking_action",
+            idempotency_key=requested_key,
+            sanitized_arguments=arguments,
+        )
+
+    assert recovery.outcome is ToolExecutionClaimOutcome.STARTED_RECOVERY
+    assert recovery.execution.idempotency_key == requested_key
+
+
+async def test_exact_key_mismatch_is_not_masked_by_unrelated_started_execution(
+    session_factory,
+) -> None:
+    (conversation_id,) = await _conversation_ids(session_factory)
+    key = f"mismatch-priority-{uuid.uuid4()}"
+    unrelated_key = f"active-unrelated-{uuid.uuid4()}"
+
+    async with session_factory.begin() as session:
+        claim = await _claim_tool_execution(
+            session,
+            conversation_id=conversation_id,
+            tool_name="prepare_create_booking",
+            idempotency_key=key,
+            sanitized_arguments={"service_code": "plumbing"},
+        )
+        _finish_success(claim)
+
+    async with session_factory.begin() as session:
+        active = await _claim_tool_execution(
+            session,
+            conversation_id=conversation_id,
+            tool_name="prepare_create_booking",
+            idempotency_key=unrelated_key,
+            sanitized_arguments={"service_code": "plumbing"},
+        )
+        assert active.outcome is ToolExecutionClaimOutcome.NEW
+
+    async with session_factory.begin() as session:
+        conflict = await _claim_tool_execution(
+            session,
+            conversation_id=conversation_id,
+            tool_name="prepare_create_booking",
+            idempotency_key=key,
+            sanitized_arguments={"service_code": "electrical"},
+        )
+
+    assert conflict.outcome is ToolExecutionClaimOutcome.IDEMPOTENCY_CONFLICT
 
 
 async def test_started_tool_execution_claim_is_recoverable_by_same_key(session_factory) -> None:
@@ -635,26 +766,95 @@ async def test_prepare_cancel_requires_owned_managed_booking_and_only_stages_act
     booking_id = await _confirmed_booking(
         session_factory, contact_id=contact_id, service_id=service_id
     )
+    cancellation_context = "customer requested cancellation"
+    key = f"prepare-cancel-{uuid.uuid4()}"
     request = CancelBookingRequest(
         conversation_id=conversation_id,
         booking_id=booking_id,
-        cancellation_context="customer requested cancellation",
-        idempotency_key=f"prepare-cancel-{uuid.uuid4()}",
+        cancellation_context=cancellation_context,
+        idempotency_key=key,
     )
 
     result = await prepare_cancel_booking(session_factory, request)
+    replay = await prepare_cancel_booking(session_factory, request)
 
     assert isinstance(result, PreparationResult)
+    assert isinstance(replay, PreparationResult)
+    assert replay.replayed is True
+    assert replay.data.action_token == result.data.action_token
     async with session_factory() as session:
         booking = await session.get(Booking, booking_id)
         conversation = await session.get(Conversation, conversation_id)
+        execution = await session.scalar(
+            select(ToolExecution).where(ToolExecution.idempotency_key == key)
+        )
+        audit_events = (
+            await session.scalars(
+                select(AuditEvent).where(AuditEvent.conversation_id == conversation_id)
+            )
+        ).all()
         assert booking is not None
         assert conversation is not None
+        assert execution is not None
         assert booking.status is BookingStatus.CONFIRMED
         assert conversation.pending_action_payload is not None
-        assert conversation.pending_action_payload["cancellation_context"] == (
-            "customer requested cancellation"
+        assert conversation.pending_action_payload["cancellation_context"] == "provided"
+        assert execution.sanitized_arguments["cancellation_context"] == "provided"
+        assert cancellation_context not in str(execution.sanitized_arguments)
+        assert cancellation_context not in str(conversation.pending_action_payload)
+        assert cancellation_context not in str(audit_events)
+
+
+@pytest.mark.parametrize(
+    "cancellation_context",
+    [
+        "customer requested cancellation",
+        "moving to Zamalek",
+        "please cancel, call me later",
+        "customer@example.com",
+        "12 Garden Road",
+        "call me at 12345",
+    ],
+)
+async def test_prepare_cancel_persists_only_controlled_context_marker(
+    session_factory, caplog: pytest.LogCaptureFixture, cancellation_context: str
+) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    key = f"prepare-cancel-privacy-{uuid.uuid4()}"
+
+    result = await prepare_cancel_booking(
+        session_factory,
+        CancelBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            cancellation_context=cancellation_context,
+            idempotency_key=key,
+        ),
+    )
+
+    assert isinstance(result, PreparationResult)
+    async with session_factory() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        execution = await session.scalar(
+            select(ToolExecution).where(ToolExecution.idempotency_key == key)
         )
+        audit_events = (
+            await session.scalars(
+                select(AuditEvent).where(AuditEvent.conversation_id == conversation_id)
+            )
+        ).all()
+        assert conversation is not None
+        assert execution is not None
+        assert conversation.pending_action_payload is not None
+        assert execution.sanitized_arguments["cancellation_context"] == "provided"
+        assert conversation.pending_action_payload["cancellation_context"] == "provided"
+        assert cancellation_context not in str(execution.sanitized_arguments)
+        assert cancellation_context not in str(conversation.pending_action_payload)
+        assert cancellation_context not in str(audit_events)
+    assert cancellation_context not in caplog.text
 
 
 async def test_prepare_reschedule_rejects_phase_one_reference_free_booking(

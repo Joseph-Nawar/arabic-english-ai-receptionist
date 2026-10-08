@@ -117,6 +117,12 @@ def _client(service: _Service) -> GoogleCalendarClient:
     return GoogleCalendarClient(_settings(), service)
 
 
+def test_google_calendar_client_exposes_configured_calendar_id() -> None:
+    client = _client(_Service(_FreeBusyResource({}), _EventsResource([{}])))
+
+    assert client.calendar_id == CALENDAR_ID
+
+
 def test_google_credentials_use_exactly_the_two_approved_scopes(monkeypatch) -> None:
     credentials = Mock(return_value=Mock())
     authorized_one = Mock(name="authorized-1")
