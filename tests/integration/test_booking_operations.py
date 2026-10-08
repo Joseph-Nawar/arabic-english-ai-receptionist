@@ -11,18 +11,23 @@ from sqlalchemy import func, select
 
 from receptionist.application import booking as booking_application
 from receptionist.application.booking import (
+    AvailabilityRequest,
     BookingErrorCode,
     BookingErrorResult,
+    BookingReadResult,
     CancelBookingRequest,
     ConfirmationResult,
     ConfirmBookingActionRequest,
     CreateBookingRequest,
+    GetBookingRequest,
     PreparationResult,
     RescheduleBookingRequest,
     ToolExecutionClaimOutcome,
     _claim_tool_execution,
     _deterministic_calendar_event_id,
+    check_availability,
     confirm_booking_action,
+    get_booking,
     prepare_cancel_booking,
     prepare_create_booking,
     prepare_reschedule_booking,
@@ -51,6 +56,7 @@ from receptionist.integrations.google_calendar import (
     CalendarErrorCode,
     CalendarEventCreate,
     CalendarEventLifecycle,
+    CalendarEventSnapshot,
     CalendarInterval,
 )
 from receptionist.seed import seed_reference_data
@@ -186,6 +192,29 @@ async def _confirmed_booking(
         session.add(booking)
         await session.flush()
         return booking.id
+
+
+async def _booking_snapshot(session_factory, booking_id: uuid.UUID) -> tuple[object, ...]:
+    async with session_factory() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        tool_count = await session.scalar(select(func.count()).select_from(ToolExecution))
+        audit_count = await session.scalar(select(func.count()).select_from(AuditEvent))
+        conversation = await session.scalar(
+            select(Conversation).where(Conversation.contact_id == booking.contact_id)
+        )
+        assert conversation is not None
+        return (
+            booking.status,
+            booking.start_at,
+            booking.end_at,
+            booking.calendar_id,
+            booking.calendar_event_id,
+            conversation.pending_action_type,
+            conversation.pending_action_status,
+            tool_count,
+            audit_count,
+        )
 
 
 def _finish_success(claim) -> None:
@@ -514,6 +543,392 @@ async def test_same_key_contention_creates_one_row_and_loser_replays(session_fac
             )
             == 1
         )
+
+
+async def test_check_availability_uses_provider_authority_and_is_read_only(session_factory) -> None:
+    await _operation_context(session_factory)
+    calendar = _calendar_double()
+    request = AvailabilityRequest(
+        service_selector="plumbing",
+        requested_start_at=REQUESTED_START,
+        requested_end_at=REQUESTED_END,
+    )
+    async with session_factory() as session:
+        before = (
+            await session.scalar(select(func.count()).select_from(Booking)),
+            await session.scalar(select(func.count()).select_from(ToolExecution)),
+            await session.scalar(select(func.count()).select_from(AuditEvent)),
+        )
+        result = await check_availability(session, calendar, request, now_utc=NOW_UTC)
+        after = (
+            await session.scalar(select(func.count()).select_from(Booking)),
+            await session.scalar(select(func.count()).select_from(ToolExecution)),
+            await session.scalar(select(func.count()).select_from(AuditEvent)),
+        )
+
+    assert result.ok is True
+    assert result.data.provider_available is True
+    assert result.data.policy_valid is True
+    assert result.data.requested_start_at_utc == REQUESTED_START
+    assert result.data.requested_end_at_utc == REQUESTED_END
+    assert result.data.read_at == NOW_UTC
+    assert calendar.free_busy_queries == [
+        (
+            CALENDAR_ID,
+            REQUESTED_START - timedelta(minutes=15),
+            REQUESTED_END + timedelta(minutes=15),
+        )
+    ]
+    assert calendar.mutation_calls == []
+    assert after == before
+
+
+async def test_check_availability_reports_provider_busy_without_local_authority(
+    session_factory,
+) -> None:
+    await _operation_context(session_factory)
+    calendar = _calendar_double(busy_intervals=(CalendarInterval(REQUESTED_START, REQUESTED_END),))
+    request = AvailabilityRequest(
+        service_selector="plumbing",
+        requested_start_at=REQUESTED_START,
+        requested_end_at=REQUESTED_END,
+    )
+    async with session_factory() as session:
+        result = await check_availability(session, calendar, request, now_utc=NOW_UTC)
+    assert result.ok is True
+    assert result.data.policy_valid is True
+    assert result.data.provider_available is False
+
+
+async def test_check_availability_reports_policy_invalid_without_provider_read(
+    session_factory,
+) -> None:
+    await _operation_context(session_factory)
+    calendar = _calendar_double()
+    request = AvailabilityRequest(
+        service_selector="plumbing",
+        requested_start_at=datetime(2026, 10, 11, 23, tzinfo=UTC),
+        requested_end_at=datetime(2026, 10, 12, 0, tzinfo=UTC),
+    )
+    async with session_factory() as session:
+        result = await check_availability(session, calendar, request, now_utc=NOW_UTC)
+    assert result.ok is True
+    assert result.data.policy_valid is False
+    assert result.data.provider_available is False
+    assert calendar.free_busy_queries == []
+
+
+@pytest.mark.parametrize(
+    "mutate,code",
+    [
+        ("inactive", BookingErrorCode.SERVICE_INACTIVE),
+        ("not_bookable", BookingErrorCode.SERVICE_NOT_BOOKABLE),
+    ],
+)
+async def test_check_availability_rejects_unavailable_service(
+    session_factory, mutate: str, code: BookingErrorCode
+) -> None:
+    _, _, service_id = await _operation_context(session_factory)
+    async with session_factory.begin() as session:
+        service = await session.get(Service, service_id)
+        assert service is not None
+        if mutate == "inactive":
+            service.active = False
+        else:
+            service.bookable = False
+    async with session_factory() as session:
+        result = await check_availability(
+            session,
+            _calendar_double(),
+            AvailabilityRequest(service_selector="plumbing", requested_start_at=REQUESTED_START),
+            now_utc=NOW_UTC,
+        )
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is code
+
+
+async def test_check_availability_bounds_calendar_failure(session_factory) -> None:
+    await _operation_context(session_factory)
+    calendar = _calendar_double(
+        free_busy_error=CalendarClientError(
+            CalendarErrorCode.CALENDAR_UNAVAILABLE,
+            "provider body must not escape",
+            retryable=True,
+        )
+    )
+    async with session_factory() as session:
+        result = await check_availability(
+            session,
+            calendar,
+            AvailabilityRequest(service_selector="plumbing", requested_start_at=REQUESTED_START),
+            now_utc=NOW_UTC,
+        )
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.CALENDAR_UNAVAILABLE
+    assert result.error.retryable is True
+    assert "provider body" not in result.model_dump_json()
+
+
+async def _seed_provider_event(
+    calendar: DeterministicCalendarDouble,
+    *,
+    booking_id: uuid.UUID,
+    calendar_id: str,
+    event_id: str,
+    interval: CalendarInterval,
+) -> None:
+    await calendar.create_event(
+        calendar_id,
+        event_id,
+        CalendarEventCreate(interval=interval, private_booking_id=str(booking_id)),
+    )
+    calendar.mutation_calls.clear()
+
+
+async def test_get_booking_returns_in_sync_provider_truth_without_mutation(session_factory) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    calendar = _calendar_double()
+    await _seed_provider_event(
+        calendar,
+        booking_id=booking_id,
+        calendar_id=CALENDAR_ID,
+        event_id=(await _booking_event_id(session_factory, booking_id)),
+        interval=CalendarInterval(REQUESTED_START, REQUESTED_END),
+    )
+    before = await _booking_snapshot(session_factory, booking_id)
+    async with session_factory() as session:
+        result = await get_booking(
+            session,
+            calendar,
+            GetBookingRequest(conversation_id=conversation_id, booking_id=booking_id),
+        )
+    after = await _booking_snapshot(session_factory, booking_id)
+    assert isinstance(result, BookingReadResult)
+    assert result.data.reconciliation_status == "in_sync"
+    assert result.data.calendar_id == CALENDAR_ID
+    assert result.data.calendar_event_id is not None
+    assert before == after
+    assert calendar.mutation_calls == []
+
+
+async def test_get_booking_hides_another_contact_booking(session_factory) -> None:
+    contact_id, _, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    _, other_conversation_id, _ = await _operation_context(session_factory)
+    async with session_factory() as session:
+        result = await get_booking(
+            session,
+            _calendar_double(),
+            GetBookingRequest(conversation_id=other_conversation_id, booking_id=booking_id),
+        )
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.BOOKING_NOT_FOUND
+    assert str(booking_id) not in result.model_dump_json()
+
+
+async def test_get_booking_reports_provider_interval_marker_and_lifecycle_divergence(
+    session_factory,
+) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    event_id = await _booking_event_id(session_factory, booking_id)
+
+    for replacement in (
+        replace(
+            CalendarEventSnapshot(
+                calendar_id=CALENDAR_ID,
+                event_id=event_id,
+                interval=CalendarInterval(
+                    REQUESTED_START + timedelta(hours=1), REQUESTED_END + timedelta(hours=1)
+                ),
+                private_booking_id=str(booking_id),
+                etag="etag-divergent",
+            )
+        ),
+        CalendarEventSnapshot(
+            calendar_id=CALENDAR_ID,
+            event_id=event_id,
+            interval=CalendarInterval(REQUESTED_START, REQUESTED_END),
+            private_booking_id="foreign-booking",
+            etag="etag-divergent",
+        ),
+        CalendarEventSnapshot(
+            calendar_id=CALENDAR_ID,
+            event_id=event_id,
+            interval=None,
+            private_booking_id=None,
+            etag=None,
+            lifecycle=CalendarEventLifecycle.CANCELLED,
+        ),
+    ):
+        calendar = _calendar_double()
+        calendar._events[(CALENDAR_ID, event_id)] = replacement
+        async with session_factory() as session:
+            result = await get_booking(
+                session,
+                calendar,
+                GetBookingRequest(conversation_id=conversation_id, booking_id=booking_id),
+            )
+        assert isinstance(result, BookingReadResult)
+        assert result.data.reconciliation_status == "provider_divergent"
+
+
+async def test_get_booking_reports_missing_confirmed_event(session_factory) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    async with session_factory() as session:
+        result = await get_booking(
+            session,
+            _calendar_double(),
+            GetBookingRequest(conversation_id=conversation_id, booking_id=booking_id),
+        )
+    assert isinstance(result, BookingReadResult)
+    assert result.data.reconciliation_status == "provider_missing"
+
+
+async def test_get_booking_cancelled_reference_absence_and_tombstone_are_in_sync(
+    session_factory,
+) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    event_id = await _booking_event_id(session_factory, booking_id)
+    async with session_factory.begin() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        booking.status = BookingStatus.CANCELLED
+        booking.cancelled_at = NOW_UTC
+    async with session_factory() as session:
+        absent = await get_booking(
+            session,
+            _calendar_double(),
+            GetBookingRequest(conversation_id=conversation_id, booking_id=booking_id),
+        )
+    assert isinstance(absent, BookingReadResult)
+    assert absent.data.reconciliation_status == "in_sync"
+
+    tombstone_calendar = _calendar_double()
+    tombstone_calendar._events[(CALENDAR_ID, event_id)] = CalendarEventSnapshot(
+        calendar_id=CALENDAR_ID,
+        event_id=event_id,
+        interval=None,
+        private_booking_id=None,
+        etag=None,
+        lifecycle=CalendarEventLifecycle.CANCELLED,
+    )
+    async with session_factory() as session:
+        tombstone = await get_booking(
+            session,
+            tombstone_calendar,
+            GetBookingRequest(conversation_id=conversation_id, booking_id=booking_id),
+        )
+    assert isinstance(tombstone, BookingReadResult)
+    assert tombstone.data.reconciliation_status == "in_sync"
+
+
+async def test_get_booking_reports_started_confirmation_without_provider_read(
+    session_factory,
+) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    async with session_factory.begin() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        booking.status = BookingStatus.PENDING
+        session.add(
+            ToolExecution(
+                conversation_id=conversation_id,
+                tool_name="confirm_booking_action",
+                status=ToolExecutionStatus.STARTED,
+                idempotency_key=f"started-read-{uuid.uuid4()}",
+                sanitized_arguments={},
+                sanitized_result={"booking_id": str(booking_id)},
+            )
+        )
+    calendar = _calendar_double()
+    async with session_factory() as session:
+        result = await get_booking(
+            session,
+            calendar,
+            GetBookingRequest(conversation_id=conversation_id, booking_id=booking_id),
+        )
+    assert isinstance(result, BookingReadResult)
+    assert result.data.reconciliation_status == "operation_in_progress"
+    assert calendar.get_event_calls == []
+
+
+async def test_get_booking_rejects_phase_one_reference_free_booking(session_factory) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    async with session_factory.begin() as session:
+        booking = Booking(
+            contact_id=contact_id,
+            service_id=service_id,
+            status=BookingStatus.PENDING,
+            start_at=REQUESTED_START,
+            end_at=REQUESTED_END,
+            booking_data={},
+        )
+        session.add(booking)
+        await session.flush()
+        booking_id = booking.id
+    async with session_factory() as session:
+        result = await get_booking(
+            session,
+            _calendar_double(),
+            GetBookingRequest(conversation_id=conversation_id, booking_id=booking_id),
+        )
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.EXTERNAL_REFERENCE_MISSING
+
+
+async def test_get_booking_bounds_provider_read_failure_and_uses_persisted_identity(
+    session_factory,
+) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    calendar = DeterministicCalendarDouble(
+        calendar_id="new-configured-calendar",
+        get_event_errors=(
+            CalendarClientError(
+                CalendarErrorCode.CALENDAR_UNAVAILABLE,
+                "provider response must not escape",
+                retryable=True,
+            ),
+        ),
+    )
+    event_id = await _booking_event_id(session_factory, booking_id)
+    async with session_factory() as session:
+        result = await get_booking(
+            session,
+            calendar,
+            GetBookingRequest(conversation_id=conversation_id, booking_id=booking_id),
+        )
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.CALENDAR_UNAVAILABLE
+    assert result.error.retryable is True
+    assert "provider response" not in result.model_dump_json()
+    assert calendar.get_event_calls == [(CALENDAR_ID, event_id)]
+
+
+async def _booking_event_id(session_factory, booking_id: uuid.UUID) -> str:
+    async with session_factory() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None and booking.calendar_event_id is not None
+        return booking.calendar_event_id
 
 
 async def test_prepare_create_stages_one_sanitized_action_without_provider_mutation(

@@ -737,13 +737,15 @@ def _availability_error(decision: AvailabilityDecision) -> BookingErrorCode | No
         return BookingErrorCode.CALENDAR_UNAVAILABLE
 
 
-def _calendar_read_error(exc: CalendarClientError) -> BookingErrorResult:
+def _calendar_read_error(
+    exc: CalendarClientError, *, operation: str = "confirm_booking_action"
+) -> BookingErrorResult:
     try:
         code = BookingErrorCode(exc.code.value)
     except ValueError:
         code = BookingErrorCode.CALENDAR_UNAVAILABLE
     return _booking_error_result(
-        "confirm_booking_action",
+        operation,
         code,
         retryable=exc.retryable,
     )
@@ -2960,6 +2962,146 @@ async def check_calendar_availability(
         effective_interval=effective_interval,
         provider_intervals=provider_intervals,
     )
+
+
+async def check_availability(
+    session: AsyncSession,
+    calendar: CalendarClient,
+    request: AvailabilityRequest,
+    *,
+    now_utc: datetime,
+) -> AvailabilityResult | BookingErrorResult:
+    """Read deterministic policy and live Calendar availability without writing state."""
+    now = _utc_storage_time(now_utc)
+    business = await session.get(BusinessConfig, 1)
+    if business is None:
+        return _booking_error_result("check_availability", BookingErrorCode.CONFIGURATION_CONFLICT)
+    service, service_error = await _resolve_service(session, request.service_selector)
+    if service_error is not None or service is None:
+        return _booking_error_result(
+            "check_availability", service_error or BookingErrorCode.UNKNOWN_SERVICE
+        )
+    try:
+        interval = normalize_requested_interval(
+            request.requested_start_at,
+            request.requested_end_at,
+            service.default_duration_minutes,
+        )
+        policy = evaluate_booking_policy(_business_spec(business), interval, now)
+    except ValueError:
+        return _booking_error_result("check_availability", BookingErrorCode.INVALID_REQUESTED_TIME)
+
+    if not policy.valid:
+        return AvailabilityResult(
+            data=AvailabilityData(
+                requested_start_at_utc=interval.start_at_utc,
+                requested_end_at_utc=interval.end_at_utc,
+                policy_valid=False,
+                provider_available=False,
+                read_at=now,
+            )
+        )
+
+    configured_calendar_id = _calendar_id(calendar)
+    if configured_calendar_id is None:
+        return _booking_error_result(
+            "check_availability", BookingErrorCode.CALENDAR_UNAVAILABLE, retryable=False
+        )
+    availability = await check_calendar_availability(
+        calendar,
+        calendar_id=configured_calendar_id,
+        policy=policy,
+    )
+    availability_error = _availability_error(availability)
+    if (
+        availability_error is not None
+        and availability_error is not BookingErrorCode.CALENDAR_INTERVAL_UNAVAILABLE
+    ):
+        return _booking_error_result(
+            "check_availability",
+            availability_error,
+            retryable=availability_error is BookingErrorCode.CALENDAR_UNAVAILABLE,
+        )
+    return AvailabilityResult(
+        data=AvailabilityData(
+            requested_start_at_utc=interval.start_at_utc,
+            requested_end_at_utc=interval.end_at_utc,
+            policy_valid=availability.policy_valid,
+            provider_available=availability.provider_available,
+            read_at=now,
+        )
+    )
+
+
+def _booking_read_data(booking: Booking, status: str) -> BookingReadData:
+    return BookingReadData(
+        booking_id=booking.id,
+        status=booking.status,
+        start_at_utc=booking.start_at,
+        end_at_utc=booking.end_at,
+        calendar_id=booking.calendar_id,
+        calendar_event_id=booking.calendar_event_id,
+        reconciliation_status=status,  # type: ignore[arg-type]
+    )
+
+
+async def get_booking(
+    session: AsyncSession,
+    calendar: CalendarClient,
+    request: GetBookingRequest,
+) -> BookingReadResult | BookingErrorResult:
+    """Read one Booking within its Conversation Contact boundary and reconcile it."""
+    conversation = await session.get(Conversation, request.conversation_id)
+    booking = await session.get(Booking, request.booking_id)
+    if conversation is None or booking is None or conversation.contact_id != booking.contact_id:
+        return _booking_error_result("get_booking", BookingErrorCode.BOOKING_NOT_FOUND)
+
+    started = (
+        await session.scalars(
+            select(ToolExecution).where(
+                ToolExecution.conversation_id == conversation.id,
+                ToolExecution.tool_name == "confirm_booking_action",
+                ToolExecution.status == ToolExecutionStatus.STARTED,
+            )
+        )
+    ).all()
+    for execution in started:
+        state = execution.sanitized_result
+        if isinstance(state, Mapping) and state.get("booking_id") == str(booking.id):
+            return BookingReadResult(data=_booking_read_data(booking, "operation_in_progress"))
+
+    if booking.calendar_id is None or booking.calendar_event_id is None:
+        return _booking_error_result("get_booking", BookingErrorCode.EXTERNAL_REFERENCE_MISSING)
+    if booking.status is BookingStatus.PENDING:
+        return _booking_error_result("get_booking", BookingErrorCode.BOOKING_STATE_CONFLICT)
+
+    try:
+        event = await calendar.get_event(booking.calendar_id, booking.calendar_event_id)
+    except CalendarClientError as exc:
+        return _calendar_read_error(exc, operation="get_booking")
+
+    if event is None:
+        status = "in_sync" if booking.status is BookingStatus.CANCELLED else "provider_missing"
+        return BookingReadResult(data=_booking_read_data(booking, status))
+    if event.calendar_id != booking.calendar_id or event.event_id != booking.calendar_event_id:
+        return BookingReadResult(data=_booking_read_data(booking, "provider_divergent"))
+    if booking.status is BookingStatus.CANCELLED:
+        status = (
+            "in_sync"
+            if event.lifecycle is CalendarEventLifecycle.CANCELLED
+            else "provider_divergent"
+        )
+        return BookingReadResult(data=_booking_read_data(booking, status))
+    if (
+        event.lifecycle is CalendarEventLifecycle.ACTIVE
+        and event.private_booking_id == str(booking.id)
+        and event.interval is not None
+        and booking.start_at is not None
+        and booking.end_at is not None
+        and event.interval == CalendarInterval(booking.start_at, booking.end_at)
+    ):
+        return BookingReadResult(data=_booking_read_data(booking, "in_sync"))
+    return BookingReadResult(data=_booking_read_data(booking, "provider_divergent"))
 
 
 async def confirm_booking_action(
