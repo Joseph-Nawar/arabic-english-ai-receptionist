@@ -2,25 +2,55 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select
 
 from receptionist.application.booking import (
+    BookingErrorCode,
+    BookingErrorResult,
+    CancelBookingRequest,
+    CreateBookingRequest,
+    PreparationResult,
+    RescheduleBookingRequest,
     ToolExecutionClaimOutcome,
     _claim_tool_execution,
+    prepare_cancel_booking,
+    prepare_create_booking,
+    prepare_reschedule_booking,
 )
-from receptionist.db.models import Contact, Conversation, ToolExecution
+from receptionist.db.models import (
+    AuditEvent,
+    Booking,
+    Contact,
+    Conversation,
+    Service,
+    ToolExecution,
+)
 from receptionist.domain.enums import (
+    BookingStatus,
     ControlMode,
     ConversationChannel,
     ConversationLanguageMode,
     ConversationStatus,
     ToolExecutionStatus,
 )
+from receptionist.integrations.google_calendar import (
+    CalendarClientError,
+    CalendarErrorCode,
+    CalendarEventCreate,
+    CalendarInterval,
+)
+from receptionist.seed import seed_reference_data
+from tests.support.calendar_double import DeterministicCalendarDouble
 
 pytestmark = pytest.mark.integration
+
+CALENDAR_ID = "calendar-id"
+NOW_UTC = datetime(2026, 10, 11, 3, tzinfo=UTC)
+REQUESTED_START = datetime(2026, 10, 11, 5, 30, tzinfo=UTC)
+REQUESTED_END = datetime(2026, 10, 11, 6, 30, tzinfo=UTC)
 
 
 async def _conversation_ids(session_factory, count: int = 1) -> tuple[uuid.UUID, ...]:
@@ -41,6 +71,88 @@ async def _conversation_ids(session_factory, count: int = 1) -> tuple[uuid.UUID,
             await session.flush()
             ids.append(conversation.id)
         return tuple(ids)
+
+
+async def _operation_context(session_factory) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    async with session_factory.begin() as session:
+        await seed_reference_data(session, "test")
+        contact = Contact(phone_e164=f"+1999{uuid.uuid4().int % 10**10:010d}")
+        session.add(contact)
+        await session.flush()
+        conversation = Conversation(
+            contact_id=contact.id,
+            channel=ConversationChannel.PHONE,
+            status=ConversationStatus.OPEN,
+            control_mode=ControlMode.AI,
+            language_mode=ConversationLanguageMode.UNKNOWN,
+        )
+        session.add(conversation)
+        await session.flush()
+        service_id = await session.scalar(select(Service.id).where(Service.code == "plumbing"))
+        assert service_id is not None
+        service = await session.get(Service, service_id)
+        assert service is not None
+        service.active = True
+        service.bookable = True
+        service.booking_requirements = []
+        return contact.id, conversation.id, service_id
+
+
+def _calendar_double(**kwargs) -> DeterministicCalendarDouble:
+    calendar = DeterministicCalendarDouble(**kwargs)
+    calendar.calendar_id = CALENDAR_ID
+    return calendar
+
+
+def _create_request(conversation_id: uuid.UUID, key: str) -> CreateBookingRequest:
+    return CreateBookingRequest(
+        conversation_id=conversation_id,
+        service_selector="plumbing",
+        service_area_selector="al_olaya",
+        requested_start_at=REQUESTED_START,
+        requested_end_at=REQUESTED_END,
+        idempotency_key=key,
+    )
+
+
+def _booking_data(
+    *, service_code: str = "plumbing", area_code: str = "al_olaya"
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "service_code": service_code,
+        "service_area_code": area_code,
+        "requested_start_at_utc": REQUESTED_START.isoformat().replace("+00:00", "Z"),
+        "requested_end_at_utc": REQUESTED_END.isoformat().replace("+00:00", "Z"),
+        "requirements": {},
+        "last_operation": "create_booking",
+    }
+
+
+async def _confirmed_booking(
+    session_factory,
+    *,
+    contact_id: uuid.UUID,
+    service_id: uuid.UUID,
+    start_at: datetime = REQUESTED_START,
+    event_id: str | None = None,
+) -> uuid.UUID:
+    event_id = event_id or f"target-event-{uuid.uuid4().hex}"
+    async with session_factory.begin() as session:
+        booking = Booking(
+            contact_id=contact_id,
+            service_id=service_id,
+            status=BookingStatus.CONFIRMED,
+            start_at=start_at,
+            end_at=start_at + (REQUESTED_END - REQUESTED_START),
+            calendar_id=CALENDAR_ID,
+            calendar_event_id=event_id,
+            booking_data=_booking_data(),
+            confirmed_at=NOW_UTC,
+        )
+        session.add(booking)
+        await session.flush()
+        return booking.id
 
 
 def _finish_success(claim) -> None:
@@ -67,9 +179,7 @@ async def test_new_tool_execution_claim_creates_one_row(session_factory) -> None
 
     async with session_factory() as session:
         rows = (
-            await session.scalars(
-                select(ToolExecution).where(ToolExecution.idempotency_key == key)
-            )
+            await session.scalars(select(ToolExecution).where(ToolExecution.idempotency_key == key))
         ).all()
         assert len(rows) == 1
         assert rows[0].status is ToolExecutionStatus.SUCCEEDED
@@ -113,9 +223,7 @@ async def test_terminal_tool_execution_claims_replay_stored_result(
             sanitized_arguments={"booking_id": "booking-id"},
         )
         assert replay.outcome is outcome
-        assert replay.execution.sanitized_result == {
-            "ok": status is ToolExecutionStatus.SUCCEEDED
-        }
+        assert replay.execution.sanitized_result == {"ok": status is ToolExecutionStatus.SUCCEEDED}
 
 
 async def test_started_tool_execution_claim_is_recoverable_by_same_key(session_factory) -> None:
@@ -240,3 +348,376 @@ async def test_same_key_contention_creates_one_row_and_loser_replays(session_fac
             )
             == 1
         )
+
+
+async def test_prepare_create_stages_one_sanitized_action_without_provider_mutation(
+    session_factory,
+) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double()
+    key = f"prepare-create-{uuid.uuid4()}"
+
+    result = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, key),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, PreparationResult)
+    assert result.data.action_type.value == "create_booking"
+    assert result.data.confirmation_required is True
+    assert result.data.requested_start_at_utc == REQUESTED_START
+    assert len(calendar.free_busy_queries) == 1
+    assert calendar.mutation_calls == []
+
+    async with session_factory() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        assert conversation is not None
+        assert conversation.pending_action_payload is not None
+        assert conversation.pending_action_payload["action_token"] == result.data.action_token
+        assert conversation.pending_action_type.value == "create_booking"
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(Booking)
+                .where(Booking.contact_id == conversation.contact_id)
+            )
+            == 0
+        )
+        execution = await session.scalar(
+            select(ToolExecution).where(ToolExecution.idempotency_key == key)
+        )
+        audit = await session.scalar(
+            select(AuditEvent).where(AuditEvent.conversation_id == conversation_id)
+        )
+        assert execution is not None
+        assert execution.status is ToolExecutionStatus.SUCCEEDED
+        assert audit is not None
+        assert "phone" not in str(execution.sanitized_arguments).casefold()
+        assert "provider" not in str(execution.sanitized_arguments).casefold()
+
+
+async def test_prepare_create_same_key_replays_and_different_key_preserves_action(
+    session_factory,
+) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double()
+    first_key = f"prepare-replay-{uuid.uuid4()}"
+
+    first = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, first_key),
+        now_utc=NOW_UTC,
+    )
+    replay = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, first_key),
+        now_utc=NOW_UTC,
+    )
+    conflict = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"prepare-other-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(first, PreparationResult)
+    assert isinstance(replay, PreparationResult)
+    assert replay.replayed is True
+    assert replay.data.action_token == first.data.action_token
+    assert isinstance(conflict, BookingErrorResult)
+    assert conflict.error.code is BookingErrorCode.PENDING_ACTION_CONFLICT
+    assert len(calendar.free_busy_queries) == 1
+
+
+@pytest.mark.parametrize(
+    "request_update,expected_code",
+    [
+        ({"service_selector": "missing-service"}, BookingErrorCode.UNKNOWN_SERVICE),
+        ({"service_area_selector": "missing-area"}, BookingErrorCode.UNSUPPORTED_SERVICE_AREA),
+        (
+            {"requested_start_at": datetime(2026, 10, 11, 4, 30, tzinfo=UTC)},
+            BookingErrorCode.OUTSIDE_BUSINESS_POLICY,
+        ),
+    ],
+)
+async def test_prepare_create_rejects_invalid_requests_without_pending_action(
+    session_factory, request_update: dict[str, object], expected_code: BookingErrorCode
+) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double()
+    request_data = _create_request(conversation_id, f"prepare-reject-{uuid.uuid4()}").model_dump()
+    request_data.update(request_update)
+    request = CreateBookingRequest.model_validate(request_data)
+
+    result = await prepare_create_booking(session_factory, calendar, request, now_utc=NOW_UTC)
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is expected_code
+    assert calendar.free_busy_queries == []
+
+    async with session_factory() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        assert conversation is not None
+        assert conversation.pending_action_type is None
+
+
+async def test_prepare_create_rejects_calendar_unavailable_and_persists_rejection(
+    session_factory,
+) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double(
+        free_busy_error=CalendarClientError(
+            CalendarErrorCode.CALENDAR_UNAVAILABLE,
+            "provider body must not escape",
+        )
+    )
+    key = f"prepare-unavailable-{uuid.uuid4()}"
+
+    result = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, key),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.CALENDAR_UNAVAILABLE
+    async with session_factory() as session:
+        execution = await session.scalar(
+            select(ToolExecution).where(ToolExecution.idempotency_key == key)
+        )
+        assert execution is not None
+        assert execution.status is ToolExecutionStatus.REJECTED
+
+
+@pytest.mark.parametrize(
+    "field,expected_code",
+    [
+        ("active", BookingErrorCode.SERVICE_INACTIVE),
+        ("bookable", BookingErrorCode.SERVICE_NOT_BOOKABLE),
+    ],
+)
+async def test_prepare_create_distinguishes_inactive_and_non_bookable_services(
+    session_factory, field: str, expected_code: BookingErrorCode
+) -> None:
+    _, conversation_id, service_id = await _operation_context(session_factory)
+    async with session_factory.begin() as session:
+        service = await session.get(Service, service_id)
+        assert service is not None
+        setattr(service, field, False)
+
+    result = await prepare_create_booking(
+        session_factory,
+        _calendar_double(),
+        _create_request(conversation_id, f"prepare-service-state-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is expected_code
+
+
+@pytest.mark.parametrize(
+    "requirements",
+    [{"unexpected": "value"}, {}],
+)
+async def test_prepare_create_rejects_unknown_or_missing_configured_requirements(
+    session_factory, requirements: dict[str, str]
+) -> None:
+    _, conversation_id, service_id = await _operation_context(session_factory)
+    async with session_factory.begin() as session:
+        service = await session.get(Service, service_id)
+        assert service is not None
+        service.booking_requirements = [
+            {
+                "key": "property_type",
+                "label_en": "Property type",
+                "label_ar": "نوع العقار",
+                "required": True,
+            }
+        ]
+    request = _create_request(conversation_id, f"prepare-requirements-{uuid.uuid4()}").model_copy(
+        update={"requirements": requirements}
+    )
+
+    result = await prepare_create_booking(
+        session_factory, _calendar_double(), request, now_utc=NOW_UTC
+    )
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.INVALID_INPUT
+
+
+async def test_prepare_reschedule_enforces_conversation_contact_ownership(session_factory) -> None:
+    contact_id, _, service_id = await _operation_context(session_factory)
+    _, other_conversation_id, _ = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+
+    result = await prepare_reschedule_booking(
+        session_factory,
+        _calendar_double(),
+        RescheduleBookingRequest(
+            conversation_id=other_conversation_id,
+            booking_id=booking_id,
+            requested_start_at=REQUESTED_START,
+            idempotency_key=f"prepare-owner-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.BOOKING_NOT_FOUND
+
+
+async def test_prepare_reschedule_stages_fingerprint_and_reads_only_calendar_conflicts(
+    session_factory,
+) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    async with session_factory() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        target_event_id = booking.calendar_event_id
+        assert target_event_id is not None
+    calendar = _calendar_double()
+    await calendar.create_event(
+        CALENDAR_ID,
+        target_event_id,
+        CalendarEventCreate(
+            interval=CalendarInterval(REQUESTED_START, REQUESTED_END),
+            private_booking_id=str(booking_id),
+        ),
+    )
+    calendar.mutation_calls.clear()
+    request = RescheduleBookingRequest(
+        conversation_id=conversation_id,
+        booking_id=booking_id,
+        requested_start_at=REQUESTED_START + (REQUESTED_END - REQUESTED_START),
+        idempotency_key=f"prepare-reschedule-{uuid.uuid4()}",
+    )
+
+    result = await prepare_reschedule_booking(session_factory, calendar, request, now_utc=NOW_UTC)
+
+    assert isinstance(result, PreparationResult)
+    assert result.data.action_type.value == "reschedule_booking"
+    assert calendar.conflict_queries == [
+        (
+            CALENDAR_ID,
+            REQUESTED_START + timedelta(minutes=45),
+            REQUESTED_END + timedelta(hours=1, minutes=15),
+            target_event_id,
+        )
+    ]
+    assert calendar.mutation_calls == []
+    async with session_factory() as session:
+        booking = await session.get(Booking, booking_id)
+        conversation = await session.get(Conversation, conversation_id)
+        assert booking is not None
+        assert conversation is not None
+        assert booking.status is BookingStatus.CONFIRMED
+        assert booking.start_at == REQUESTED_START
+        assert conversation.pending_action_payload is not None
+        assert len(conversation.pending_action_payload["expected_state_fingerprint"]) == 64
+
+
+async def test_prepare_cancel_requires_owned_managed_booking_and_only_stages_action(
+    session_factory,
+) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    request = CancelBookingRequest(
+        conversation_id=conversation_id,
+        booking_id=booking_id,
+        cancellation_context="customer requested cancellation",
+        idempotency_key=f"prepare-cancel-{uuid.uuid4()}",
+    )
+
+    result = await prepare_cancel_booking(session_factory, request)
+
+    assert isinstance(result, PreparationResult)
+    async with session_factory() as session:
+        booking = await session.get(Booking, booking_id)
+        conversation = await session.get(Conversation, conversation_id)
+        assert booking is not None
+        assert conversation is not None
+        assert booking.status is BookingStatus.CONFIRMED
+        assert conversation.pending_action_payload is not None
+        assert conversation.pending_action_payload["cancellation_context"] == (
+            "customer requested cancellation"
+        )
+
+
+async def test_prepare_reschedule_rejects_phase_one_reference_free_booking(
+    session_factory,
+) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    async with session_factory.begin() as session:
+        booking = Booking(
+            contact_id=contact_id,
+            service_id=service_id,
+            status=BookingStatus.PENDING,
+            start_at=REQUESTED_START,
+            end_at=REQUESTED_END,
+            booking_data={},
+        )
+        session.add(booking)
+        await session.flush()
+        booking_id = booking.id
+
+    result = await prepare_reschedule_booking(
+        session_factory,
+        _calendar_double(),
+        RescheduleBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            requested_start_at=REQUESTED_START,
+            idempotency_key=f"prepare-primitive-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code in {
+        BookingErrorCode.BOOKING_STATE_CONFLICT,
+        BookingErrorCode.EXTERNAL_REFERENCE_MISSING,
+    }
+
+
+async def test_prepare_operations_never_call_calendar_mutation_methods(session_factory) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    calendar = _calendar_double()
+    create_result = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"prepare-no-mutation-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(create_result, PreparationResult)
+    assert calendar.mutation_calls == []
+
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    calendar = _calendar_double()
+    await prepare_reschedule_booking(
+        session_factory,
+        calendar,
+        RescheduleBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            requested_start_at=REQUESTED_START + timedelta(hours=1),
+            idempotency_key=f"prepare-reschedule-no-mutation-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+    assert calendar.mutation_calls == []

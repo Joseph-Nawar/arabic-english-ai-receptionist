@@ -23,10 +23,12 @@ class DeterministicCalendarDouble:
     def __init__(
         self,
         *,
+        calendar_id: str = "calendar-id",
         busy_intervals: Iterable[CalendarBusyInterval | CalendarInterval] = (),
         free_busy_error: CalendarClientError | None = None,
         ambiguous_create_event_ids: set[str] | None = None,
     ) -> None:
+        self.calendar_id = calendar_id
         self._busy_intervals = tuple(busy_intervals)
         self._free_busy_error = free_busy_error
         self._ambiguous_create_event_ids = ambiguous_create_event_ids or set()
@@ -34,6 +36,7 @@ class DeterministicCalendarDouble:
         self._etag_counter = 0
         self.free_busy_queries: list[tuple[str, datetime, datetime]] = []
         self.conflict_queries: list[tuple[str, datetime, datetime, str | None]] = []
+        self.mutation_calls: list[tuple[str, str, str]] = []
 
     def _next_etag(self) -> str:
         self._etag_counter += 1
@@ -81,6 +84,7 @@ class DeterministicCalendarDouble:
     async def create_event(
         self, calendar_id: str, event_id: str, event: CalendarEventCreate
     ) -> CalendarEventSnapshot:
+        self.mutation_calls.append(("create", calendar_id, event_id))
         key = (calendar_id, event_id)
         if key in self._events:
             raise CalendarClientError(
@@ -110,6 +114,7 @@ class DeterministicCalendarDouble:
         owned_fields: CalendarEventPatch,
         if_match_etag: str,
     ) -> CalendarEventSnapshot:
+        self.mutation_calls.append(("patch", calendar_id, event_id))
         event = self._events.get((calendar_id, event_id))
         if event is None:
             raise CalendarClientError(
@@ -133,6 +138,7 @@ class DeterministicCalendarDouble:
         return updated
 
     async def cancel_event(self, calendar_id: str, event_id: str, if_match_etag: str) -> None:
+        self.mutation_calls.append(("cancel", calendar_id, event_id))
         event = self._events.get((calendar_id, event_id))
         if event is None:
             return

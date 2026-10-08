@@ -213,7 +213,14 @@ class GoogleCalendarClient:
 
     def __init__(self, settings: Settings, service: Any) -> None:
         self._timeout = settings.google_calendar_request_timeout_seconds
+        if settings.google_calendar_id is None:
+            raise ValueError("Google Calendar ID is required for the Calendar client")
+        self._calendar_id = settings.google_calendar_id
         self._service = service
+
+    @property
+    def calendar_id(self) -> str:
+        return self._calendar_id
 
     @classmethod
     def from_settings(cls, settings: Settings) -> GoogleCalendarClient:
