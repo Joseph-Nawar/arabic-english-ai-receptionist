@@ -2,9 +2,17 @@
 
 ## Boundaries
 
-Unit tests live in `tests/unit`. They do not require Docker, PostgreSQL, network access, or external providers. They cover settings isolation/secret safety, app construction, and liveness.
+Unit tests live in `tests/unit`. They do not require Docker, PostgreSQL, network access, or external providers. They cover settings isolation/secret safety, app construction, and liveness. The shared pytest configuration blocks `httplib2` network transport, so an accidental live Google Calendar request fails immediately.
 
 Integration tests live in `tests/integration` and use real PostgreSQL. They cover SQLAlchemy/Psycopg connectivity and disposal, Alembic upgrade → downgrade → upgrade, and readiness behavior. The normal CI job provides PostgreSQL as a service and does not call external SaaS providers.
+
+All normal automated verification is provider-free: `make test`, `make test-unit`,
+`make test-integration`, `make check`, `make verify`, and GitHub CI do not require
+Calendar credentials and do not make live Google Calendar, CRM, messaging, voice,
+LLM, or other SaaS calls. Booking integration tests inject the deterministic
+Calendar double; Google request translation is tested with mocked service and
+transport objects. Live Google verification is a separate guarded Task 16 smoke
+operation and is not part of these commands.
 
 ## Test database and destruction guard
 

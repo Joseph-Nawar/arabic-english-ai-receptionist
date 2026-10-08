@@ -4,6 +4,7 @@ import asyncio
 from datetime import UTC, datetime
 from unittest.mock import Mock, call
 
+import httplib2
 import pytest
 from googleapiclient.errors import HttpError
 from pydantic import SecretStr
@@ -124,6 +125,11 @@ def test_google_calendar_client_exposes_configured_calendar_id() -> None:
     client = _client(_Service(_FreeBusyResource({}), _EventsResource([{}])))
 
     assert client.calendar_id == CALENDAR_ID
+
+
+def test_automated_tests_block_live_calendar_transport() -> None:
+    with pytest.raises(AssertionError, match="live Calendar network access"):
+        httplib2.Http().request("https://www.googleapis.com/calendar/v3")
 
 
 def test_google_credentials_use_exactly_the_two_approved_scopes(monkeypatch) -> None:

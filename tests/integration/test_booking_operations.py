@@ -7,8 +7,8 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from receptionist.application import booking as booking_application
 from receptionist.application.booking import (
