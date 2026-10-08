@@ -15,6 +15,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_httplib2 import AuthorizedHttp  # type: ignore[import-untyped]
 from googleapiclient.discovery import build  # type: ignore[import-untyped]
 from googleapiclient.errors import HttpError  # type: ignore[import-untyped]
+from googleapiclient.http import HttpRequest  # type: ignore[import-untyped]
 
 from receptionist.core.config import Settings
 
@@ -186,13 +187,23 @@ def _http_status(error: HttpError) -> int | None:
 
 
 def _map_http_error(
-    error: HttpError, *, missing_code: CalendarErrorCode | None
+    error: HttpError,
+    *,
+    missing_code: CalendarErrorCode | None,
+    is_write: bool,
 ) -> CalendarClientError:
     status = _http_status(error)
     if status == 404 and missing_code is not None:
         return _safe_error(missing_code)
-    if status == 412:
+    if status == 412 and is_write:
         return _safe_error(CalendarErrorCode.EXTERNAL_STATE_CONFLICT, retryable=True)
+    if status == 429:
+        return _safe_error(CalendarErrorCode.CALENDAR_UNAVAILABLE, retryable=True)
+    if is_write and (status in {408, 409} or (status is not None and status >= 500)):
+        return _safe_error(
+            CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED,
+            retryable=True,
+        )
     retryable = status in {408, 429} or (status is not None and status >= 500)
     return _safe_error(CalendarErrorCode.CALENDAR_UNAVAILABLE, retryable=retryable)
 
@@ -222,15 +233,38 @@ class GoogleCalendarClient:
                 client_secret=client_secret.get_secret_value(),
                 scopes=_OAUTH_SCOPES,  # type: ignore[no-untyped-call]
             )
-            authorized_http = AuthorizedHttp(
-                credentials,
-                http=httplib2.Http(timeout=settings.google_calendar_request_timeout_seconds),
-            )
+
+            def request_builder(
+                _service_http: Any,
+                postproc: Any,
+                uri: str,
+                *,
+                method: str = "GET",
+                body: Any = None,
+                headers: Any = None,
+                methodId: str | None = None,
+                resumable: Any = None,
+            ) -> HttpRequest:
+                transport = AuthorizedHttp(
+                    credentials,
+                    http=httplib2.Http(timeout=settings.google_calendar_request_timeout_seconds),
+                )
+                return HttpRequest(
+                    transport,
+                    postproc,
+                    uri,
+                    method=method,
+                    body=body,
+                    headers=headers,
+                    methodId=methodId,
+                    resumable=resumable,
+                )
+
             service = build(
                 "calendar",
                 "v3",
-                http=authorized_http,
                 credentials=credentials,
+                requestBuilder=request_builder,
                 cache_discovery=False,
             )
         except Exception as exc:
@@ -242,6 +276,7 @@ class GoogleCalendarClient:
         request_factory: Callable[[], Any],
         *,
         missing_code: CalendarErrorCode | None = None,
+        is_write: bool = False,
     ) -> Any:
         try:
             return await asyncio.wait_for(
@@ -249,15 +284,30 @@ class GoogleCalendarClient:
                 timeout=self._timeout,
             )
         except TimeoutError as exc:
-            raise _safe_error(CalendarErrorCode.CALENDAR_UNAVAILABLE, retryable=True) from exc
+            code = (
+                CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED
+                if is_write
+                else CalendarErrorCode.CALENDAR_UNAVAILABLE
+            )
+            raise _safe_error(code, retryable=True) from exc
         except HttpError as exc:
-            raise _map_http_error(exc, missing_code=missing_code) from exc
+            raise _map_http_error(exc, missing_code=missing_code, is_write=is_write) from exc
         except OSError as exc:
-            raise _safe_error(CalendarErrorCode.CALENDAR_UNAVAILABLE, retryable=True) from exc
+            code = (
+                CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED
+                if is_write
+                else CalendarErrorCode.CALENDAR_UNAVAILABLE
+            )
+            raise _safe_error(code, retryable=True) from exc
         except CalendarClientError:
             raise
         except Exception as exc:
-            raise _safe_error(CalendarErrorCode.CALENDAR_UNAVAILABLE) from exc
+            code = (
+                CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED
+                if is_write
+                else CalendarErrorCode.CALENDAR_UNAVAILABLE
+            )
+            raise _safe_error(code, retryable=is_write) from exc
 
     @staticmethod
     def _calendar_entry(response: Mapping[str, Any], calendar_id: str) -> Mapping[str, Any]:
@@ -377,9 +427,9 @@ class GoogleCalendarClient:
         response = await self._execute(
             lambda: self._service.events().insert(
                 calendarId=calendar_id,
-                eventId=event_id,
                 body=body,
-            )
+            ),
+            is_write=True,
         )
         return _event_snapshot(response, calendar_id)
 
@@ -411,6 +461,7 @@ class GoogleCalendarClient:
         response = await self._execute(
             request_factory,
             missing_code=CalendarErrorCode.EXTERNAL_EVENT_MISSING,
+            is_write=True,
         )
         return _event_snapshot(response, calendar_id)
 
@@ -423,6 +474,7 @@ class GoogleCalendarClient:
         await self._execute(
             request_factory,
             missing_code=CalendarErrorCode.EXTERNAL_EVENT_MISSING,
+            is_write=True,
         )
 
 

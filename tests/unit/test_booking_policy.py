@@ -32,7 +32,6 @@ from receptionist.domain.config import (
     WeeklyHours,
 )
 from receptionist.domain.enums import BookingStatus, Weekday
-from receptionist.integrations.google_calendar import CalendarInterval
 from receptionist.seed import build_reference_business, build_reference_services
 
 pytestmark = pytest.mark.unit
@@ -250,11 +249,11 @@ def test_availability_decision_is_policy_and_provider_truth_with_half_open_edges
         datetime(2026, 10, 11, 6, 45, tzinfo=UTC),
         datetime(2026, 10, 11, 8, 15, tzinfo=UTC),
     )
-    touching_before = CalendarInterval(
+    touching_before = RequestedInterval(
         datetime(2026, 10, 11, 6, tzinfo=UTC),
         datetime(2026, 10, 11, 6, 45, tzinfo=UTC),
     )
-    touching_after = CalendarInterval(
+    touching_after = RequestedInterval(
         datetime(2026, 10, 11, 8, 15, tzinfo=UTC),
         datetime(2026, 10, 11, 9, tzinfo=UTC),
     )
@@ -270,7 +269,7 @@ def test_availability_decision_is_policy_and_provider_truth_with_half_open_edges
     )
     assert free == AvailabilityDecision(True, True, None, effective)
 
-    blocking = CalendarInterval(
+    blocking = RequestedInterval(
         datetime(2026, 10, 11, 8, tzinfo=UTC),
         datetime(2026, 10, 11, 8, 30, tzinfo=UTC),
     )

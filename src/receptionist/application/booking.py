@@ -23,7 +23,6 @@ from receptionist.domain.enums import BookingStatus, PendingActionType
 from receptionist.integrations.google_calendar import (
     CalendarClient,
     CalendarClientError,
-    CalendarInterval,
 )
 
 __all__ = [
@@ -370,7 +369,7 @@ async def check_calendar_availability(
                 effective_interval.end_at_utc,
             )
             provider_intervals = tuple(
-                CalendarInterval(interval.start_at_utc, interval.end_at_utc)
+                RequestedInterval(interval.start_at_utc, interval.end_at_utc)
                 for interval in busy_intervals
             )
         else:
@@ -380,7 +379,13 @@ async def check_calendar_availability(
                 effective_interval.end_at_utc,
                 exclude_event_id=exclude_event_id,
             )
-            provider_intervals = tuple(conflict.interval for conflict in conflicts)
+            provider_intervals = tuple(
+                RequestedInterval(
+                    conflict.interval.start_at_utc,
+                    conflict.interval.end_at_utc,
+                )
+                for conflict in conflicts
+            )
     except CalendarClientError as exc:
         return AvailabilityDecision(
             policy_valid=True,

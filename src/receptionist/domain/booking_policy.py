@@ -22,7 +22,6 @@ from receptionist.domain.config import (
     normalize_catalog_text,
 )
 from receptionist.domain.enums import BookingStatus, Weekday
-from receptionist.integrations.google_calendar import CalendarInterval
 
 _OUTSIDE_BUSINESS_POLICY: Final = "outside_business_policy"
 _MAX_DETAIL_LENGTH: Final = 500
@@ -264,7 +263,7 @@ def evaluate_booking_policy(
     return PolicyDecision(valid=True, error_code=None, effective_interval=effective_interval)
 
 
-def intervals_overlap(left: RequestedInterval, right: CalendarInterval) -> bool:
+def intervals_overlap(left: RequestedInterval, right: RequestedInterval) -> bool:
     """Use half-open interval semantics for provider conflict decisions."""
     return left.start_at_utc < right.end_at_utc and right.start_at_utc < left.end_at_utc
 
@@ -273,7 +272,7 @@ def decide_availability(
     *,
     policy_valid: bool,
     effective_interval: RequestedInterval,
-    provider_intervals: tuple[CalendarInterval, ...],
+    provider_intervals: tuple[RequestedInterval, ...],
     policy_error_code: str | None = None,
 ) -> AvailabilityDecision:
     """Return availability only from policy validity and provider intervals."""
