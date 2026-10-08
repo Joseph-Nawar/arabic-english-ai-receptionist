@@ -31,17 +31,17 @@ async def test_calendar_double_supports_free_busy_event_crud_and_etags() -> None
     double = DeterministicCalendarDouble()
     created = await double.create_event(
         CALENDAR_ID,
-        "event-id",
+        "eventid",
         CalendarEventCreate(interval=INTERVAL, private_booking_id="booking-id"),
     )
 
-    assert created.event_id == "event-id"
+    assert created.event_id == "eventid"
     assert created.private_booking_id == "booking-id"
-    assert await double.get_event(CALENDAR_ID, "event-id") == created
+    assert await double.get_event(CALENDAR_ID, "eventid") == created
 
     patched = await double.patch_event(
         CALENDAR_ID,
-        "event-id",
+        "eventid",
         CalendarEventPatch(
             interval=CalendarInterval(
                 start_at_utc=INTERVAL.start_at_utc + timedelta(hours=1),
@@ -56,14 +56,25 @@ async def test_calendar_double_supports_free_busy_event_crud_and_etags() -> None
     with pytest.raises(CalendarClientError) as exc_info:
         await double.patch_event(
             CALENDAR_ID,
-            "event-id",
+            "eventid",
             CalendarEventPatch(interval=INTERVAL),
             created.etag,
         )
     assert exc_info.value.code is CalendarErrorCode.EXTERNAL_STATE_CONFLICT
 
-    await double.cancel_event(CALENDAR_ID, "event-id", patched.etag)
-    assert await double.get_event(CALENDAR_ID, "event-id") is None
+    await double.cancel_event(CALENDAR_ID, "eventid", patched.etag)
+    assert await double.get_event(CALENDAR_ID, "eventid") is None
+
+
+async def test_calendar_double_rejects_invalid_google_event_ids() -> None:
+    double = DeterministicCalendarDouble()
+
+    with pytest.raises(ValueError):
+        await double.create_event(
+            CALENDAR_ID,
+            "invalid-event-id",
+            CalendarEventCreate(interval=INTERVAL, private_booking_id="booking-id"),
+        )
 
 
 def test_calendar_double_exposes_configured_calendar_id_contract() -> None:
@@ -82,7 +93,7 @@ async def test_calendar_double_supports_busy_and_conflict_reads() -> None:
 
     blocker = await double.create_event(
         CALENDAR_ID,
-        "blocker-id",
+        "blockerid",
         CalendarEventCreate(interval=INTERVAL, private_booking_id="blocker-booking"),
     )
     conflicts = await double.query_conflicts(
@@ -92,17 +103,17 @@ async def test_calendar_double_supports_busy_and_conflict_reads() -> None:
 
 
 async def test_calendar_double_ambiguous_create_persists_before_recoverable_error() -> None:
-    double = DeterministicCalendarDouble(ambiguous_create_event_ids={"event-id"})
+    double = DeterministicCalendarDouble(ambiguous_create_event_ids={"eventid"})
 
     with pytest.raises(CalendarClientError) as exc_info:
         await double.create_event(
             CALENDAR_ID,
-            "event-id",
+            "eventid",
             CalendarEventCreate(interval=INTERVAL, private_booking_id="booking-id"),
         )
 
     assert exc_info.value.code is CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED
-    persisted = await double.get_event(CALENDAR_ID, "event-id")
+    persisted = await double.get_event(CALENDAR_ID, "eventid")
     assert persisted is not None
     assert persisted.private_booking_id == "booking-id"
 
@@ -139,7 +150,7 @@ def _policy(
 
 
 async def test_calendar_backed_availability_allows_reschedule_self_overlap() -> None:
-    target_id = "target-event"
+    target_id = "targetevent"
     double = DeterministicCalendarDouble()
     target = await double.create_event(
         CALENDAR_ID,
@@ -166,7 +177,7 @@ async def test_calendar_backed_availability_allows_buffer_touching_only_self() -
     double = DeterministicCalendarDouble()
     target = await double.create_event(
         CALENDAR_ID,
-        "target-event",
+        "targetevent",
         CalendarEventCreate(interval=INTERVAL, private_booking_id="target-booking"),
     )
 
@@ -184,12 +195,12 @@ async def test_calendar_backed_availability_rejects_another_event_in_effective_i
     double = DeterministicCalendarDouble()
     target = await double.create_event(
         CALENDAR_ID,
-        "target-event",
+        "targetevent",
         CalendarEventCreate(interval=INTERVAL, private_booking_id="target-booking"),
     )
     await double.create_event(
         CALENDAR_ID,
-        "other-event",
+        "otherevent",
         CalendarEventCreate(
             interval=CalendarInterval(
                 datetime(2026, 10, 11, 7, 30, tzinfo=UTC),
@@ -256,7 +267,7 @@ async def test_calendar_backed_availability_excludes_only_exact_target_id() -> N
     double = DeterministicCalendarDouble()
     target = await double.create_event(
         CALENDAR_ID,
-        "target-event",
+        "targetevent",
         CalendarEventCreate(interval=INTERVAL, private_booking_id="target-booking"),
     )
 

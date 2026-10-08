@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from unittest.mock import Mock, call
 
@@ -13,9 +14,11 @@ from receptionist.integrations.google_calendar import (
     CalendarClientError,
     CalendarErrorCode,
     CalendarEventCreate,
+    CalendarEventLifecycle,
     CalendarEventPatch,
     CalendarInterval,
     GoogleCalendarClient,
+    _event_snapshot,
 )
 
 pytestmark = pytest.mark.unit
@@ -206,6 +209,69 @@ async def test_provider_failures_map_to_bounded_errors_without_raw_details() -> 
     assert "provider-body" not in str(exc_info.value)
 
 
+def test_cancelled_event_snapshot_accepts_id_only() -> None:
+    snapshot = _event_snapshot({"id": "eventid", "status": "cancelled"}, CALENDAR_ID)
+
+    assert snapshot.lifecycle is CalendarEventLifecycle.CANCELLED
+    assert snapshot.event_id == "eventid"
+    assert snapshot.interval is None
+    assert snapshot.etag is None
+    assert snapshot.private_booking_id is None
+
+
+def test_cancelled_event_snapshot_accepts_optional_fields_without_active_shape() -> None:
+    snapshot = _event_snapshot(
+        {
+            "id": "eventid",
+            "status": "cancelled",
+            "etag": "etag-1",
+            "extendedProperties": {"private": {"receptionist_booking_id": "booking-id"}},
+        },
+        CALENDAR_ID,
+    )
+
+    assert snapshot.lifecycle is CalendarEventLifecycle.CANCELLED
+    assert snapshot.interval is None
+    assert snapshot.etag == "etag-1"
+    assert snapshot.private_booking_id == "booking-id"
+
+
+def test_active_event_snapshot_parses_full_provider_event() -> None:
+    snapshot = _event_snapshot(
+        {
+            "id": "eventid",
+            "status": "confirmed",
+            "etag": "etag-1",
+            "start": {"dateTime": "2026-10-11T07:00:00+00:00"},
+            "end": {"dateTime": "2026-10-11T08:00:00+00:00"},
+            "extendedProperties": {"private": {"receptionist_booking_id": "booking-id"}},
+        },
+        CALENDAR_ID,
+    )
+
+    assert snapshot.lifecycle is CalendarEventLifecycle.ACTIVE
+    assert snapshot.interval == CalendarInterval(TIME_MIN, datetime(2026, 10, 11, 8, tzinfo=UTC))
+    assert snapshot.etag == "etag-1"
+    assert snapshot.private_booking_id == "booking-id"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"id": "eventid", "status": "confirmed", "start": {}, "end": {}},
+        {"id": "eventid", "status": "confirmed", "etag": "etag-1"},
+    ],
+)
+def test_active_event_snapshot_requires_interval_and_etag(event: dict[str, object]) -> None:
+    with pytest.raises(CalendarClientError) as exc_info:
+        _event_snapshot(event, CALENDAR_ID)
+
+    assert exc_info.value.code in {
+        CalendarErrorCode.EXTERNAL_STATE_CONFLICT,
+        CalendarErrorCode.CALENDAR_UNAVAILABLE,
+    }
+
+
 @pytest.mark.parametrize(
     ("status", "expected_code", "retryable"),
     [
@@ -280,6 +346,29 @@ async def test_write_timeout_requires_reconciliation(monkeypatch, operation: str
     assert exc_info.value.code is CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED
     assert exc_info.value.retryable
     assert "provider-body" not in str(exc_info.value)
+
+
+async def test_write_execution_waits_for_worker_after_shorter_caller_deadline(monkeypatch) -> None:
+    worker_started = asyncio.Event()
+    release_worker = asyncio.Event()
+
+    async def delayed_to_thread(function, *args, **kwargs):
+        worker_started.set()
+        await release_worker.wait()
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(google_calendar.asyncio, "to_thread", delayed_to_thread)
+    client = _client(_Service(_FreeBusyResource({}), _EventsResource([{}])))
+    request = _Request({"ok": True})
+    task = asyncio.create_task(client._execute(lambda: request, is_write=True))
+
+    await asyncio.wait_for(worker_started.wait(), timeout=1)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(task), timeout=0.01)
+    assert not task.done()
+
+    release_worker.set()
+    assert await task == {"ok": True}
 
 
 async def test_create_transport_failure_requires_reconciliation() -> None:

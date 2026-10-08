@@ -11,6 +11,7 @@ from receptionist.integrations.google_calendar import (
     CalendarConflict,
     CalendarErrorCode,
     CalendarEventCreate,
+    CalendarEventLifecycle,
     CalendarEventPatch,
     CalendarEventSnapshot,
     CalendarInterval,
@@ -33,7 +34,9 @@ class DeterministicCalendarDouble:
         foreign_marker_event_ids: set[str] | None = None,
         foreign_marker: bool = False,
         ambiguous_patch_after_success: bool = False,
+        crash_after_patch_success: bool = False,
         ambiguous_cancel_after_success: bool = False,
+        get_event_errors: Iterable[CalendarClientError | None] = (),
     ) -> None:
         self.calendar_id = calendar_id
         self._busy_intervals = tuple(busy_intervals)
@@ -45,7 +48,9 @@ class DeterministicCalendarDouble:
         self._foreign_marker_event_ids = foreign_marker_event_ids or set()
         self._foreign_marker = foreign_marker
         self._ambiguous_patch_after_success = ambiguous_patch_after_success
+        self._crash_after_patch_success = crash_after_patch_success
         self._ambiguous_cancel_after_success = ambiguous_cancel_after_success
+        self._get_event_errors = list(get_event_errors)
         self._events: dict[tuple[str, str], CalendarEventSnapshot] = {}
         self._etag_counter = 0
         self.free_busy_queries: list[tuple[str, datetime, datetime]] = []
@@ -88,16 +93,25 @@ class DeterministicCalendarDouble:
         for (event_calendar_id, event_id), event in self._events.items():
             if event_calendar_id != calendar_id or event_id == exclude_event_id:
                 continue
-            if self._overlaps(requested, event.interval):
+            if event.interval is not None and self._overlaps(requested, event.interval):
                 conflicts.append(CalendarConflict(event_id=event_id, interval=event.interval))
         return tuple(conflicts)
 
     async def get_event(self, calendar_id: str, event_id: str) -> CalendarEventSnapshot | None:
+        if self._get_event_errors:
+            error = self._get_event_errors.pop(0)
+            if error is not None:
+                raise error
         return self._events.get((calendar_id, event_id))
 
     async def create_event(
         self, calendar_id: str, event_id: str, event: CalendarEventCreate
     ) -> CalendarEventSnapshot:
+        allowed_event_id_characters = "0123456789abcdefghijklmnopqrstuv"
+        if not 5 <= len(event_id) <= 1024 or any(
+            character not in allowed_event_id_characters for character in event_id
+        ):
+            raise ValueError("Calendar event ID is not valid for Google Calendar")
         self.mutation_calls.append(("create", calendar_id, event_id))
         key = (calendar_id, event_id)
         if self._ambiguous_create_before_success:
@@ -150,6 +164,15 @@ class DeterministicCalendarDouble:
                 CalendarErrorCode.EXTERNAL_EVENT_MISSING,
                 "the Calendar event is missing",
             )
+        if (
+            event.lifecycle is not CalendarEventLifecycle.ACTIVE
+            or event.interval is None
+            or event.etag is None
+        ):
+            raise CalendarClientError(
+                CalendarErrorCode.EXTERNAL_STATE_CONFLICT,
+                "the Calendar event is not active",
+            )
         if event.etag != if_match_etag:
             raise CalendarClientError(
                 CalendarErrorCode.EXTERNAL_STATE_CONFLICT,
@@ -164,6 +187,9 @@ class DeterministicCalendarDouble:
             etag=self._next_etag(),
         )
         self._events[(calendar_id, event_id)] = updated
+        if self._crash_after_patch_success:
+            self._crash_after_patch_success = False
+            raise RuntimeError("simulated crash after Calendar patch")
         if self._ambiguous_patch_after_success:
             self._ambiguous_patch_after_success = False
             raise CalendarClientError(
@@ -178,6 +204,15 @@ class DeterministicCalendarDouble:
         event = self._events.get((calendar_id, event_id))
         if event is None:
             return
+        if (
+            event.lifecycle is not CalendarEventLifecycle.ACTIVE
+            or event.interval is None
+            or event.etag is None
+        ):
+            raise CalendarClientError(
+                CalendarErrorCode.EXTERNAL_STATE_CONFLICT,
+                "the Calendar event is not active",
+            )
         if event.etag != if_match_etag:
             raise CalendarClientError(
                 CalendarErrorCode.EXTERNAL_STATE_CONFLICT,

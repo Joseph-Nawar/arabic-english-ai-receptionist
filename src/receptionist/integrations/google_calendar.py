@@ -105,9 +105,9 @@ class CalendarConflict:
 class CalendarEventSnapshot:
     calendar_id: str
     event_id: str
-    interval: CalendarInterval
+    interval: CalendarInterval | None
     private_booking_id: str | None
-    etag: str
+    etag: str | None
     lifecycle: CalendarEventLifecycle = CalendarEventLifecycle.ACTIVE
 
 
@@ -295,10 +295,10 @@ class GoogleCalendarClient:
         is_write: bool = False,
     ) -> Any:
         try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(lambda: request_factory().execute(num_retries=0)),
-                timeout=self._timeout,
-            )
+            execution = asyncio.to_thread(lambda: request_factory().execute(num_retries=0))
+            if is_write:
+                return await execution
+            return await asyncio.wait_for(execution, timeout=self._timeout)
         except TimeoutError as exc:
             code = (
                 CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED
@@ -538,10 +538,8 @@ def _event_interval(event: Mapping[str, Any], response_timezone: object) -> Cale
 
 def _event_snapshot(event: Mapping[str, Any], calendar_id: str) -> CalendarEventSnapshot:
     event_id = event.get("id")
-    etag = event.get("etag")
-    if not isinstance(event_id, str) or not isinstance(etag, str):
+    if not isinstance(event_id, str):
         raise _safe_error(CalendarErrorCode.EXTERNAL_STATE_CONFLICT)
-    interval = _event_interval(event, event.get("timeZone"))
     private_booking_id: str | None = None
     extended_properties = event.get("extendedProperties")
     if isinstance(extended_properties, Mapping):
@@ -550,17 +548,27 @@ def _event_snapshot(event: Mapping[str, Any], calendar_id: str) -> CalendarEvent
             marker = private_properties.get("receptionist_booking_id")
             if isinstance(marker, str):
                 private_booking_id = marker
+    if event.get("status") == CalendarEventLifecycle.CANCELLED:
+        etag = event.get("etag")
+        return CalendarEventSnapshot(
+            calendar_id=calendar_id,
+            event_id=event_id,
+            interval=None,
+            private_booking_id=private_booking_id,
+            etag=etag if isinstance(etag, str) else None,
+            lifecycle=CalendarEventLifecycle.CANCELLED,
+        )
+    etag = event.get("etag")
+    if not isinstance(etag, str):
+        raise _safe_error(CalendarErrorCode.EXTERNAL_STATE_CONFLICT)
+    interval = _event_interval(event, event.get("timeZone"))
     return CalendarEventSnapshot(
         calendar_id=calendar_id,
         event_id=event_id,
         interval=interval,
         private_booking_id=private_booking_id,
         etag=etag,
-        lifecycle=(
-            CalendarEventLifecycle.CANCELLED
-            if event.get("status") == "cancelled"
-            else CalendarEventLifecycle.ACTIVE
-        ),
+        lifecycle=CalendarEventLifecycle.ACTIVE,
     )
 
 
