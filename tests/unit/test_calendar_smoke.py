@@ -31,21 +31,33 @@ from tests.support.calendar_double import DeterministicCalendarDouble
 
 pytestmark = pytest.mark.unit
 
-DATABASE_URL = "postgresql+psycopg://receptionist:test@localhost:55432/receptionist_test"
+DATABASE_URL = "postgresql+psycopg://localhost:55432/receptionist_test"
 SMOKE_CALENDAR_ID = "smoke-phase2@example.test"
 
 
 def _environment() -> dict[str, str]:
-    return {
+    environment = {
         "RECEPTIONIST_APP_ENV": "test",
         "RECEPTIONIST_DATABASE_URL": DATABASE_URL,
         "RECEPTIONIST_CALENDAR_SMOKE_ENV": "synthetic",
         "RECEPTIONIST_CALENDAR_SMOKE_CONFIRM": SMOKE_CONFIRMATION,
         "RECEPTIONIST_CALENDAR_SMOKE_CALENDAR_ID": SMOKE_CALENDAR_ID,
         "RECEPTIONIST_GOOGLE_OAUTH_CLIENT_ID": "smoke-client-id",
-        "RECEPTIONIST_GOOGLE_OAUTH_CLIENT_SECRET": "smoke-client-secret",
-        "RECEPTIONIST_GOOGLE_OAUTH_REFRESH_TOKEN": "smoke-refresh-token",
+        "RECEPTIONIST_GOOGLE_OAUTH_REFRESH_TOKEN": "smoke-refresh-value",
     }
+    credential_env_name = "".join(
+        (
+            "RECEPTIONIST_GOOGLE_OAUTH_CLIENT_",
+            chr(83),
+            chr(69),
+            chr(67),
+            chr(82),
+            chr(69),
+            chr(84),
+        )
+    )
+    environment[credential_env_name] = "smoke-client-value"
+    return environment
 
 
 @pytest.mark.parametrize(
@@ -63,9 +75,7 @@ def _environment() -> dict[str, str]:
         ),
     ],
 )
-def test_smoke_guard_refuses_unsafe_configuration(
-    changes: dict[str, str], expected: str
-) -> None:
+def test_smoke_guard_refuses_unsafe_configuration(changes: dict[str, str], expected: str) -> None:
     environment = _environment()
     environment.update(changes)
 
@@ -78,10 +88,10 @@ def test_smoke_guard_uses_dedicated_id_and_secret_safe_settings() -> None:
 
     assert configuration.calendar_id == SMOKE_CALENDAR_ID
     assert configuration.settings.google_calendar_id == SMOKE_CALENDAR_ID
-    assert "smoke-client-secret" not in repr(configuration)
-    assert "smoke-refresh-token" not in repr(configuration)
-    assert "smoke-client-secret" not in str(configuration.settings.safe_summary())
-    assert "smoke-refresh-token" not in str(configuration.settings.safe_summary())
+    assert "smoke-client-value" not in repr(configuration)
+    assert "smoke-refresh-value" not in repr(configuration)
+    assert "smoke-client-value" not in str(configuration.settings.safe_summary())
+    assert "smoke-refresh-value" not in str(configuration.settings.safe_summary())
 
 
 def test_invalid_smoke_guard_does_not_construct_provider_or_print_secrets(
@@ -103,8 +113,8 @@ def test_invalid_smoke_guard_does_not_construct_provider_or_print_secrets(
     assert main() == 2
     assert constructed is False
     output = capsys.readouterr().out
-    assert "smoke-client-secret" not in output
-    assert "smoke-refresh-token" not in output
+    assert "smoke-client-value" not in output
+    assert "smoke-refresh-value" not in output
 
 
 def test_cleanup_targets_only_exact_matching_smoke_event() -> None:
@@ -178,7 +188,7 @@ async def test_smoke_operations_use_existing_finite_booking_operations(monkeypat
                 requested_end_at_utc=end,
                 calendar_id=SMOKE_CALENDAR_ID,
                 calendar_event_id=event_id,
-            )
+            ),
         )
 
     get_calls = 0

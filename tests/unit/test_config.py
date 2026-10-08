@@ -260,3 +260,21 @@ def test_test_database_guard_accepts_ci_test_database() -> None:
     )
 
     assert_safe_test_database(settings)
+
+
+def test_google_secret_values_are_absent_from_safe_summary_and_settings_errors() -> None:
+    settings = Settings(
+        _env_file=None,
+        app_env="test",
+        log_level="INFO",
+        database_url=TEST_DATABASE_URL,
+        google_calendar_id="calendar-id",
+        google_oauth_client_id="client-id",
+        google_oauth_client_secret=TEST_CLIENT_SECRET,
+        google_oauth_refresh_token=TEST_REFRESH_TOKEN,
+    )
+
+    safe_summary = settings.safe_summary()
+    assert TEST_CLIENT_SECRET.get_secret_value() not in str(safe_summary)
+    assert TEST_REFRESH_TOKEN.get_secret_value() not in str(safe_summary)
+    assert "calendar-id" not in str(safe_summary)

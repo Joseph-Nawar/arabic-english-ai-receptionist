@@ -278,6 +278,35 @@ def test_active_event_snapshot_requires_interval_and_etag(event: dict[str, objec
     }
 
 
+def test_provider_event_snapshot_drops_unowned_payload_fields() -> None:
+    snapshot = _event_snapshot(
+        {
+            "id": "eventid",
+            "status": "confirmed",
+            "etag": "provider-etag-sentinel",
+            "description": "provider-description-sentinel",
+            "htmlLink": "https://provider.example/event",
+            "headers": {"X-Provider": "provider-header-sentinel"},
+            "start": {"dateTime": "2026-10-11T07:00:00+00:00"},
+            "end": {"dateTime": "2026-10-11T08:00:00+00:00"},
+            "extendedProperties": {
+                "private": {"receptionist_booking_id": "booking-id"},
+                "shared": {"provider": "shared-provider-value"},
+            },
+        },
+        CALENDAR_ID,
+    )
+
+    snapshot_text = repr(snapshot)
+    assert snapshot.calendar_id == CALENDAR_ID
+    assert snapshot.event_id == "eventid"
+    assert snapshot.private_booking_id == "booking-id"
+    assert snapshot.etag == "provider-etag-sentinel"
+    assert "provider-description-sentinel" not in snapshot_text
+    assert "provider-header-sentinel" not in snapshot_text
+    assert "shared-provider-value" not in snapshot_text
+
+
 @pytest.mark.parametrize(
     ("status", "expected_code", "retryable"),
     [

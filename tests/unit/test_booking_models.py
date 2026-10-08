@@ -19,6 +19,7 @@ from receptionist.application.booking import (
     PreparationData,
     PreparationResult,
     RescheduleBookingRequest,
+    SanitizedMetadata,
     ServiceAreaLookupRequest,
     ServiceLookupRequest,
     generate_action_token,
@@ -312,3 +313,18 @@ def test_explicit_results_serialize_without_raw_provider_objects() -> None:
         },
     )
     assert booking_read.data.status is BookingStatus.PENDING
+
+
+def test_sanitized_metadata_rejects_customer_and_provider_payload_fields() -> None:
+    sentinel_values = {
+        "phone": "+15555550199",
+        "email": "customer-sentinel@example.test",
+        "address": "17 Sentinel Road",
+        "transcript": "customer transcript sentinel",
+        "raw": "provider body sentinel",
+        "etag": "provider-etag-sentinel",
+    }
+
+    for key, value in sentinel_values.items():
+        with pytest.raises(ValidationError):
+            SanitizedMetadata(values={key: value})

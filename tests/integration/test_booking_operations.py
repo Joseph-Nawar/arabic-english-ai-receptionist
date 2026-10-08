@@ -1612,6 +1612,74 @@ async def test_confirm_create_reconciles_booking_and_clears_action(session_facto
         assert event.private_booking_id == str(booking.id)
 
 
+async def test_confirm_create_durable_state_excludes_provider_etag_and_customer_pii(
+    session_factory,
+) -> None:
+    contact_id, conversation_id, _ = await _operation_context(session_factory)
+    sentinel_phone = f"+1555{uuid.uuid4().int % 10**7:07d}"
+    sentinel_email = "customer-sentinel@example.test"
+    sentinel_address = "17 Sentinel Road"
+    sentinel_transcript = "customer transcript sentinel"
+    async with session_factory.begin() as session:
+        contact = await session.get(Contact, contact_id)
+        assert contact is not None
+        contact.phone_e164 = sentinel_phone
+        contact.email = sentinel_email
+        contact.display_name = sentinel_address
+
+    calendar = _calendar_double()
+    preparation = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"privacy-create-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+    confirmation_key = f"privacy-confirm-{uuid.uuid4()}"
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=preparation.data.action_type,
+            action_token=preparation.data.action_token,
+            idempotency_key=confirmation_key,
+        ),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(result, ConfirmationResult)
+
+    async with session_factory() as session:
+        booking = await session.get(Booking, result.data.booking_id)
+        execution = await session.scalar(
+            select(ToolExecution).where(ToolExecution.idempotency_key == confirmation_key)
+        )
+        audit = await session.scalar(
+            select(AuditEvent).where(AuditEvent.conversation_id == conversation_id)
+        )
+        assert booking is not None
+        assert execution is not None
+        assert audit is not None
+        durable_text = " ".join(
+            [
+                str(booking.booking_data),
+                str(execution.sanitized_arguments),
+                str(execution.sanitized_result),
+                str(audit.sanitized_metadata),
+            ]
+        )
+        for sentinel in (
+            sentinel_phone,
+            sentinel_email,
+            sentinel_address,
+            sentinel_transcript,
+            "etag-1",
+            "provider-body",
+        ):
+            assert sentinel not in durable_text
+        assert "etag" not in durable_text.casefold()
+
+
 async def test_confirm_create_same_key_replays_without_second_calendar_event(
     session_factory,
 ) -> None:
