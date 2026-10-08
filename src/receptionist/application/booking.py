@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from receptionist.db.models import ToolExecution
 from receptionist.domain.booking_policy import (
     AvailabilityDecision,
     PolicyDecision,
@@ -19,7 +26,12 @@ from receptionist.domain.booking_policy import (
     decide_availability,
     intervals_overlap,
 )
-from receptionist.domain.enums import BookingStatus, PendingActionStatus, PendingActionType
+from receptionist.domain.enums import (
+    BookingStatus,
+    PendingActionStatus,
+    PendingActionType,
+    ToolExecutionStatus,
+)
 from receptionist.domain.state import PendingActionState
 from receptionist.integrations.google_calendar import (
     CalendarClient,
@@ -209,6 +221,24 @@ class BookingErrorCode(StrEnum):
     CALENDAR_RECONCILIATION_REQUIRED = "calendar_reconciliation_required"
 
 
+class ToolExecutionClaimOutcome(StrEnum):
+    NEW = "new"
+    SUCCEEDED_REPLAY = "succeeded_replay"
+    REJECTED_REPLAY = "rejected_replay"
+    FAILED_REPLAY = "failed_replay"
+    STARTED_RECOVERY = "started_recovery"
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+    OPERATION_IN_PROGRESS = "operation_in_progress"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExecutionClaim:
+    """The explicit claim/replay outcome for one booking operation key."""
+
+    outcome: ToolExecutionClaimOutcome
+    execution: ToolExecution
+
+
 class BookingError(_BookingModel):
     code: BookingErrorCode
     message: str = Field(min_length=1, max_length=300)
@@ -362,6 +392,92 @@ class BookingErrorResult(_BookingModel):
     error: BookingError
 
     _operation_not_blank = field_validator("operation")(_require_non_blank)
+
+
+def _arguments_fingerprint(arguments: Mapping[str, object]) -> str:
+    try:
+        encoded = json.dumps(
+            dict(arguments), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("sanitized arguments must be JSON serializable") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _claim_matches(
+    execution: ToolExecution,
+    *,
+    conversation_id: UUID,
+    tool_name: str,
+    arguments_fingerprint: str,
+) -> bool:
+    return (
+        execution.conversation_id == conversation_id
+        and execution.tool_name == tool_name
+        and _arguments_fingerprint(execution.sanitized_arguments) == arguments_fingerprint
+    )
+
+
+async def _claim_tool_execution(
+    session: AsyncSession,
+    *,
+    conversation_id: UUID,
+    tool_name: str,
+    idempotency_key: str,
+    sanitized_arguments: dict[str, object],
+) -> ToolExecutionClaim:
+    """Claim one booking execution key with PostgreSQL conflict-safe insertion."""
+    arguments_fingerprint = _arguments_fingerprint(sanitized_arguments)
+    active_execution = await session.scalar(
+        select(ToolExecution)
+        .where(
+            ToolExecution.conversation_id == conversation_id,
+            ToolExecution.tool_name == tool_name,
+            ToolExecution.status == ToolExecutionStatus.STARTED,
+            ToolExecution.idempotency_key != idempotency_key,
+        )
+        .with_for_update()
+    )
+    if active_execution is not None:
+        return ToolExecutionClaim(ToolExecutionClaimOutcome.OPERATION_IN_PROGRESS, active_execution)
+
+    statement = (
+        pg_insert(ToolExecution)
+        .values(
+            conversation_id=conversation_id,
+            tool_name=tool_name,
+            status=ToolExecutionStatus.STARTED,
+            idempotency_key=idempotency_key,
+            sanitized_arguments=sanitized_arguments,
+        )
+        .on_conflict_do_nothing()
+        .returning(ToolExecution)
+    )
+    inserted = (await session.execute(statement)).scalar_one_or_none()
+    if inserted is not None:
+        return ToolExecutionClaim(ToolExecutionClaimOutcome.NEW, inserted)
+
+    existing = await session.scalar(
+        select(ToolExecution)
+        .where(ToolExecution.idempotency_key == idempotency_key)
+        .with_for_update()
+    )
+    if existing is None:
+        raise RuntimeError("idempotency claim disappeared after conflict")
+    if not _claim_matches(
+        existing,
+        conversation_id=conversation_id,
+        tool_name=tool_name,
+        arguments_fingerprint=arguments_fingerprint,
+    ):
+        return ToolExecutionClaim(ToolExecutionClaimOutcome.IDEMPOTENCY_CONFLICT, existing)
+    outcomes = {
+        ToolExecutionStatus.SUCCEEDED: ToolExecutionClaimOutcome.SUCCEEDED_REPLAY,
+        ToolExecutionStatus.REJECTED: ToolExecutionClaimOutcome.REJECTED_REPLAY,
+        ToolExecutionStatus.FAILED: ToolExecutionClaimOutcome.FAILED_REPLAY,
+        ToolExecutionStatus.STARTED: ToolExecutionClaimOutcome.STARTED_RECOVERY,
+    }
+    return ToolExecutionClaim(outcomes[existing.status], existing)
 
 
 async def check_calendar_availability(
