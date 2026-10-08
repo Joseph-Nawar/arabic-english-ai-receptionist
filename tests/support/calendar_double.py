@@ -29,6 +29,7 @@ class DeterministicCalendarDouble:
         ambiguous_create_event_ids: set[str] | None = None,
         ambiguous_create_before_success: bool = False,
         ambiguous_create_after_success: bool = False,
+        crash_after_create_success: bool = False,
         foreign_marker_event_ids: set[str] | None = None,
         foreign_marker: bool = False,
         ambiguous_patch_after_success: bool = False,
@@ -40,6 +41,7 @@ class DeterministicCalendarDouble:
         self._ambiguous_create_event_ids = ambiguous_create_event_ids or set()
         self._ambiguous_create_before_success = ambiguous_create_before_success
         self._ambiguous_create_after_success = ambiguous_create_after_success
+        self._crash_after_create_success = crash_after_create_success
         self._foreign_marker_event_ids = foreign_marker_event_ids or set()
         self._foreign_marker = foreign_marker
         self._ambiguous_patch_after_success = ambiguous_patch_after_success
@@ -122,6 +124,9 @@ class DeterministicCalendarDouble:
             etag=self._next_etag(),
         )
         self._events[key] = snapshot
+        if self._crash_after_create_success:
+            self._crash_after_create_success = False
+            raise RuntimeError("simulated crash after Calendar create")
         if event_id in self._ambiguous_create_event_ids or self._ambiguous_create_after_success:
             self._ambiguous_create_after_success = False
             raise CalendarClientError(

@@ -1219,3 +1219,336 @@ async def test_confirm_create_ambiguous_provider_success_reconciles_one_event(
     assert isinstance(replay, ConfirmationResult)
     assert replay.replayed is True
     assert len(calendar.mutation_calls) == 1
+
+
+async def test_confirm_create_recovers_after_crash_following_provider_success(
+    session_factory,
+) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double(crash_after_create_success=True)
+    preparation = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"prepare-crash-recovery-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+    request = ConfirmBookingActionRequest(
+        conversation_id=conversation_id,
+        action_type=preparation.data.action_type,
+        action_token=preparation.data.action_token,
+        idempotency_key=f"confirm-crash-recovery-{uuid.uuid4()}",
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await confirm_booking_action(session_factory, calendar, request, now_utc=NOW_UTC)
+
+    async with session_factory() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        assert conversation is not None
+        booking = await session.scalar(
+            select(Booking).where(Booking.contact_id == conversation.contact_id)
+        )
+        execution = await session.scalar(
+            select(ToolExecution).where(
+                ToolExecution.idempotency_key == request.idempotency_key
+            )
+        )
+        assert booking is not None
+        assert execution is not None
+        assert booking.status is BookingStatus.PENDING
+        assert execution.status is ToolExecutionStatus.STARTED
+        assert conversation.pending_action_status is PendingActionStatus.CONFIRMED
+        assert booking.calendar_event_id is not None
+        assert await calendar.get_event(CALENDAR_ID, booking.calendar_event_id) is not None
+        booking_id = booking.id
+
+    recovered = await confirm_booking_action(session_factory, calendar, request, now_utc=NOW_UTC)
+
+    assert isinstance(recovered, ConfirmationResult)
+    assert len(calendar.mutation_calls) == 1
+    async with session_factory() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        assert booking.status is BookingStatus.CONFIRMED
+        execution = await session.scalar(
+            select(ToolExecution).where(
+                ToolExecution.idempotency_key == request.idempotency_key
+            )
+        )
+        assert execution is not None
+        assert execution.status is ToolExecutionStatus.SUCCEEDED
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(Booking)
+                .where(Booking.contact_id == booking.contact_id)
+            )
+            == 1
+        )
+
+
+async def _seed_calendar_event_for_booking(
+    session_factory, calendar: DeterministicCalendarDouble, booking_id: uuid.UUID
+) -> str:
+    async with session_factory() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        assert booking.calendar_event_id is not None
+        assert booking.start_at is not None
+        assert booking.end_at is not None
+        event_id = booking.calendar_event_id
+        interval = CalendarInterval(booking.start_at, booking.end_at)
+    await calendar.create_event(
+        CALENDAR_ID,
+        event_id,
+        CalendarEventCreate(interval=interval, private_booking_id=str(booking_id)),
+    )
+    calendar.mutation_calls.clear()
+    return event_id
+
+
+async def test_confirm_reschedule_patches_only_owned_interval_and_reconciles(
+    session_factory,
+) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    calendar = _calendar_double()
+    event_id = await _seed_calendar_event_for_booking(session_factory, calendar, booking_id)
+    requested_start = REQUESTED_START + timedelta(hours=1)
+    preparation = await prepare_reschedule_booking(
+        session_factory,
+        calendar,
+        RescheduleBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            requested_start_at=requested_start,
+            idempotency_key=f"prepare-reschedule-confirm-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=PendingActionType.RESCHEDULE_BOOKING,
+            action_token=preparation.data.action_token,
+            idempotency_key=f"confirm-reschedule-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, ConfirmationResult)
+    assert result.data.status is BookingStatus.CONFIRMED
+    assert calendar.mutation_calls == [("patch", CALENDAR_ID, event_id)]
+    event = await calendar.get_event(CALENDAR_ID, event_id)
+    assert event is not None
+    assert event.interval == CalendarInterval(requested_start, requested_start + timedelta(hours=1))
+    async with session_factory() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        assert booking.status is BookingStatus.CONFIRMED
+        assert booking.start_at == requested_start
+        assert booking.end_at == requested_start + timedelta(hours=1)
+
+
+async def test_confirm_cancel_deletes_event_and_retains_historical_references(
+    session_factory,
+) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    calendar = _calendar_double()
+    event_id = await _seed_calendar_event_for_booking(session_factory, calendar, booking_id)
+    preparation = await prepare_cancel_booking(
+        session_factory,
+        CancelBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            idempotency_key=f"prepare-cancel-confirm-{uuid.uuid4()}",
+        ),
+    )
+    assert isinstance(preparation, PreparationResult)
+
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=PendingActionType.CANCEL_BOOKING,
+            action_token=preparation.data.action_token,
+            idempotency_key=f"confirm-cancel-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, ConfirmationResult)
+    assert result.data.status is BookingStatus.CANCELLED
+    assert calendar.mutation_calls == [("cancel", CALENDAR_ID, event_id)]
+    assert await calendar.get_event(CALENDAR_ID, event_id) is None
+    async with session_factory() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        assert booking.status is BookingStatus.CANCELLED
+        assert booking.calendar_id == CALENDAR_ID
+        assert booking.calendar_event_id == event_id
+        assert booking.cancelled_at is not None
+
+
+async def test_confirm_cancel_already_absent_event_is_reconciled_without_delete(
+    session_factory,
+) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    calendar = _calendar_double()
+    preparation = await prepare_cancel_booking(
+        session_factory,
+        CancelBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            idempotency_key=f"prepare-cancel-absent-{uuid.uuid4()}",
+        ),
+    )
+    assert isinstance(preparation, PreparationResult)
+
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=PendingActionType.CANCEL_BOOKING,
+            action_token=preparation.data.action_token,
+            idempotency_key=f"confirm-cancel-absent-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, ConfirmationResult)
+    assert result.data.status is BookingStatus.CANCELLED
+    assert calendar.mutation_calls == []
+
+
+async def test_confirm_reschedule_rejects_stale_fingerprint_without_patch(session_factory) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    calendar = _calendar_double()
+    await _seed_calendar_event_for_booking(session_factory, calendar, booking_id)
+    preparation = await prepare_reschedule_booking(
+        session_factory,
+        calendar,
+        RescheduleBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            requested_start_at=REQUESTED_START + timedelta(hours=1),
+            idempotency_key=f"prepare-reschedule-stale-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+    async with session_factory.begin() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        booking.booking_data = {**booking.booking_data, "requirements": {"changed": "yes"}}
+
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=PendingActionType.RESCHEDULE_BOOKING,
+            action_token=preparation.data.action_token,
+            idempotency_key=f"confirm-reschedule-stale-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.STALE_PENDING_ACTION
+    assert calendar.mutation_calls == []
+    async with session_factory() as session:
+        booking = await session.get(Booking, booking_id)
+        conversation = await session.get(Conversation, conversation_id)
+        assert booking is not None
+        assert conversation is not None
+        assert booking.status is BookingStatus.CONFIRMED
+        assert conversation.pending_action_type is None
+
+
+async def test_confirm_reschedule_ambiguous_patch_reconciles_desired_state(
+    session_factory,
+) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    calendar = _calendar_double(ambiguous_patch_after_success=True)
+    await _seed_calendar_event_for_booking(session_factory, calendar, booking_id)
+    requested_start = REQUESTED_START + timedelta(hours=1)
+    preparation = await prepare_reschedule_booking(
+        session_factory,
+        calendar,
+        RescheduleBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            requested_start_at=requested_start,
+            idempotency_key=f"prepare-reschedule-ambiguous-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=PendingActionType.RESCHEDULE_BOOKING,
+            action_token=preparation.data.action_token,
+            idempotency_key=f"confirm-reschedule-ambiguous-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, ConfirmationResult)
+    assert calendar.mutation_calls == [("patch", CALENDAR_ID, next(iter(calendar._events))[1])]
+
+
+async def test_confirm_cancel_ambiguous_delete_reconciles_absent_event(session_factory) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    calendar = _calendar_double(ambiguous_cancel_after_success=True)
+    event_id = await _seed_calendar_event_for_booking(session_factory, calendar, booking_id)
+    preparation = await prepare_cancel_booking(
+        session_factory,
+        CancelBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            idempotency_key=f"prepare-cancel-ambiguous-{uuid.uuid4()}",
+        ),
+    )
+    assert isinstance(preparation, PreparationResult)
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=PendingActionType.CANCEL_BOOKING,
+            action_token=preparation.data.action_token,
+            idempotency_key=f"confirm-cancel-ambiguous-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, ConfirmationResult)
+    assert calendar.mutation_calls == [("cancel", CALENDAR_ID, event_id)]

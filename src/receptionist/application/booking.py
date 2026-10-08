@@ -60,6 +60,7 @@ from receptionist.integrations.google_calendar import (
     CalendarErrorCode,
     CalendarEventCreate,
     CalendarEventLifecycle,
+    CalendarEventPatch,
     CalendarInterval,
 )
 
@@ -1151,6 +1152,677 @@ async def _claim_create_confirmation(
         return None
 
 
+async def _claim_managed_booking_confirmation(
+    session_factory: async_sessionmaker[AsyncSession],
+    request: ConfirmBookingActionRequest,
+    *,
+    expected_action_type: PendingActionType,
+    now_utc: datetime,
+) -> ConfirmationResult | BookingErrorResult | None:
+    now = _utc_storage_time(now_utc)
+    operation = "confirm_booking_action"
+    async with session_factory.begin() as session:
+        claim = await _claim_tool_execution(
+            session,
+            conversation_id=request.conversation_id,
+            tool_name=operation,
+            idempotency_key=request.idempotency_key,
+            sanitized_arguments=_confirmation_arguments(request),
+        )
+        replay = _confirmation_claim_replay(claim)
+        if replay is not None:
+            return replay
+        is_recovery = claim.outcome is ToolExecutionClaimOutcome.STARTED_RECOVERY
+        business, conversation, contact, _ = await _lock_ordered_rows(
+            session,
+            conversation_id=request.conversation_id,
+        )
+        if business is None or conversation is None or contact is None:
+            return _booking_error_result(operation, BookingErrorCode.INVALID_INPUT)
+        payload = conversation.pending_action_payload
+        action_matches = (
+            conversation.pending_action_type is request.action_type
+            and request.action_type is expected_action_type
+            and isinstance(payload, Mapping)
+            and payload.get("action_token") == request.action_token
+        )
+        if not action_matches:
+            current_is_valid = (
+                conversation.pending_action_type is not None
+                and conversation.pending_action_status is PendingActionStatus.AWAITING_CONFIRMATION
+                and isinstance(payload, Mapping)
+                and isinstance(payload.get("action_token"), str)
+            )
+            return _confirmation_rejection(
+                session,
+                conversation=conversation,
+                execution=claim.execution,
+                code=BookingErrorCode.STALE_PENDING_ACTION,
+                finished_at=now,
+                clear_action=not current_is_valid,
+            )
+        if not isinstance(payload, Mapping):
+            return _confirmation_rejection(
+                session,
+                conversation=conversation,
+                execution=claim.execution,
+                code=BookingErrorCode.STALE_PENDING_ACTION,
+                finished_at=now,
+                clear_action=True,
+            )
+        booking_value = payload.get("booking_id")
+        if not isinstance(booking_value, str):
+            return _confirmation_rejection(
+                session,
+                conversation=conversation,
+                execution=claim.execution,
+                code=BookingErrorCode.STALE_PENDING_ACTION,
+                finished_at=now,
+                clear_action=True,
+            )
+        try:
+            booking_id = UUID(booking_value)
+        except ValueError:
+            return _confirmation_rejection(
+                session,
+                conversation=conversation,
+                execution=claim.execution,
+                code=BookingErrorCode.STALE_PENDING_ACTION,
+                finished_at=now,
+                clear_action=True,
+            )
+        booking = await session.scalar(
+            select(Booking).where(Booking.id == booking_id).with_for_update()
+        )
+        if booking is None or booking.contact_id != contact.id:
+            return _confirmation_rejection(
+                session,
+                conversation=conversation,
+                execution=claim.execution,
+                code=BookingErrorCode.BOOKING_NOT_FOUND,
+                finished_at=now,
+                clear_action=True,
+            )
+        if is_recovery:
+            if (
+                conversation.pending_action_status is not PendingActionStatus.CONFIRMED
+                or payload.get("confirmation_execution_id") != str(claim.execution.id)
+                or booking.status is not BookingStatus.PENDING
+            ):
+                return _confirmation_rejection(
+                    session,
+                    conversation=conversation,
+                    execution=claim.execution,
+                    code=BookingErrorCode.STALE_PENDING_ACTION,
+                    finished_at=now,
+                    clear_action=False,
+                )
+            return None
+        if conversation.pending_action_status is not PendingActionStatus.AWAITING_CONFIRMATION:
+            return _confirmation_rejection(
+                session,
+                conversation=conversation,
+                execution=claim.execution,
+                code=BookingErrorCode.STALE_PENDING_ACTION,
+                finished_at=now,
+                clear_action=True,
+            )
+        if booking.status is not BookingStatus.CONFIRMED:
+            return _confirmation_rejection(
+                session,
+                conversation=conversation,
+                execution=claim.execution,
+                code=BookingErrorCode.BOOKING_STATE_CONFLICT,
+                finished_at=now,
+                clear_action=True,
+            )
+        if (
+            booking.calendar_id is None
+            or booking.calendar_event_id is None
+            or booking.start_at is None
+            or booking.end_at is None
+        ):
+            return _confirmation_rejection(
+                session,
+                conversation=conversation,
+                execution=claim.execution,
+                code=BookingErrorCode.EXTERNAL_REFERENCE_MISSING,
+                finished_at=now,
+                clear_action=True,
+            )
+        if payload.get("expected_state_fingerprint") != _expected_booking_fingerprint(booking):
+            return _confirmation_rejection(
+                session,
+                conversation=conversation,
+                execution=claim.execution,
+                code=BookingErrorCode.STALE_PENDING_ACTION,
+                finished_at=now,
+                clear_action=True,
+            )
+        try:
+            desired_interval = (
+                _stored_interval(payload)
+                if expected_action_type is PendingActionType.RESCHEDULE_BOOKING
+                else RequestedInterval(booking.start_at, booking.end_at)
+            )
+        except ValueError:
+            return _confirmation_rejection(
+                session,
+                conversation=conversation,
+                execution=claim.execution,
+                code=BookingErrorCode.STALE_PENDING_ACTION,
+                finished_at=now,
+                clear_action=True,
+            )
+        prior_data = dict(booking.booking_data)
+        claim_state = {
+            "schema_version": 1,
+            "confirmation_state": "claimed",
+            "booking_id": str(booking.id),
+            "calendar_id": booking.calendar_id,
+            "calendar_event_id": booking.calendar_event_id,
+            "action_type": expected_action_type.value,
+            "action_token": request.action_token,
+            "execution_id": str(claim.execution.id),
+            "desired_start_at_utc": _iso_utc(desired_interval.start_at_utc),
+            "desired_end_at_utc": _iso_utc(desired_interval.end_at_utc),
+            "prior_start_at_utc": _iso_utc(booking.start_at),
+            "prior_end_at_utc": _iso_utc(booking.end_at),
+            "prior_booking_data": prior_data,
+            "prior_confirmed_at": _iso_utc(booking.confirmed_at)
+            if booking.confirmed_at is not None
+            else None,
+        }
+        booking.status = BookingStatus.PENDING
+        booking.confirmed_at = None
+        booking.cancelled_at = None
+        claim.execution.sanitized_result = claim_state
+        confirmed_payload = dict(payload)
+        confirmed_payload["confirmation_execution_id"] = str(claim.execution.id)
+        conversation.pending_action_payload = confirmed_payload
+        conversation.pending_action_status = PendingActionStatus.CONFIRMED
+        conversation.pending_action_confirmed_at = now
+        return None
+
+
+def _state_interval(state: Mapping[str, object], prefix: str) -> RequestedInterval:
+    start = state.get(f"{prefix}_start_at_utc")
+    end = state.get(f"{prefix}_end_at_utc")
+    if not isinstance(start, str) or not isinstance(end, str):
+        raise ValueError("confirmation state interval is missing")
+    return RequestedInterval(
+        _utc_storage_time(datetime.fromisoformat(start.replace("Z", "+00:00"))),
+        _utc_storage_time(datetime.fromisoformat(end.replace("Z", "+00:00"))),
+    )
+
+
+def _restore_managed_booking(booking: Booking, state: Mapping[str, object]) -> None:
+    booking.status = BookingStatus.CONFIRMED
+    booking.start_at = _state_interval(state, "prior").start_at_utc
+    booking.end_at = _state_interval(state, "prior").end_at_utc
+    prior_data = state.get("prior_booking_data")
+    booking.booking_data = dict(prior_data) if isinstance(prior_data, Mapping) else {}
+    prior_confirmed_at = state.get("prior_confirmed_at")
+    booking.confirmed_at = (
+        _utc_storage_time(datetime.fromisoformat(prior_confirmed_at.replace("Z", "+00:00")))
+        if isinstance(prior_confirmed_at, str)
+        else None
+    )
+    booking.cancelled_at = None
+
+
+def _managed_confirmation_failure(
+    session: AsyncSession,
+    *,
+    conversation: Conversation,
+    execution: ToolExecution,
+    booking: Booking,
+    state: Mapping[str, object],
+    code: BookingErrorCode,
+    now: datetime,
+) -> BookingErrorResult:
+    _restore_managed_booking(booking, state)
+    result = _booking_error_result("confirm_booking_action", code)
+    _terminalize_execution(
+        session,
+        conversation=conversation,
+        execution=execution,
+        result=result,
+        finished_at=now,
+    )
+    _clear_pending_action(conversation)
+    return result
+
+
+def _managed_confirmation_success(
+    session: AsyncSession,
+    *,
+    conversation: Conversation,
+    execution: ToolExecution,
+    booking: Booking,
+    state: Mapping[str, object],
+    action_type: PendingActionType,
+    now: datetime,
+) -> ConfirmationResult:
+    desired = _state_interval(state, "desired")
+    if action_type is PendingActionType.RESCHEDULE_BOOKING:
+        prior_data = state.get("prior_booking_data")
+        prior_data = dict(prior_data) if isinstance(prior_data, Mapping) else {}
+        booking.booking_data = {
+            **prior_data,
+            "requested_start_at_utc": _iso_utc(desired.start_at_utc),
+            "requested_end_at_utc": _iso_utc(desired.end_at_utc),
+            "last_operation": "reschedule_booking",
+        }
+        booking.start_at = desired.start_at_utc
+        booking.end_at = desired.end_at_utc
+        booking.status = BookingStatus.CONFIRMED
+        booking.confirmed_at = now
+        booking.cancelled_at = None
+    else:
+        prior_data = state.get("prior_booking_data")
+        booking.booking_data = {
+            **(dict(prior_data) if isinstance(prior_data, Mapping) else {}),
+            "last_operation": "cancel_booking",
+        }
+        booking.status = BookingStatus.CANCELLED
+        booking.cancelled_at = now
+    result = ConfirmationResult(
+        data=ConfirmationData(
+            booking_id=booking.id,
+            status=booking.status,
+            requested_start_at_utc=booking.start_at,
+            requested_end_at_utc=booking.end_at,
+            calendar_id=booking.calendar_id,
+            calendar_event_id=booking.calendar_event_id,
+        )
+    )
+    _terminalize_execution(
+        session,
+        conversation=conversation,
+        execution=execution,
+        result=result,
+        finished_at=now,
+    )
+    _clear_pending_action(conversation)
+    return result
+
+
+async def _finalize_managed_booking_confirmation(
+    session_factory: async_sessionmaker[AsyncSession],
+    calendar: CalendarClient,
+    request: ConfirmBookingActionRequest,
+    *,
+    expected_action_type: PendingActionType,
+    now_utc: datetime,
+) -> ConfirmationResult | BookingErrorResult:
+    now = _utc_storage_time(now_utc)
+    async with session_factory.begin() as session:
+        business, conversation, contact, _ = await _lock_ordered_rows(
+            session,
+            conversation_id=request.conversation_id,
+        )
+        if business is None or conversation is None or contact is None:
+            return _booking_error_result("confirm_booking_action", BookingErrorCode.INVALID_INPUT)
+        execution = await session.scalar(
+            select(ToolExecution)
+            .where(
+                ToolExecution.idempotency_key == request.idempotency_key,
+                ToolExecution.conversation_id == request.conversation_id,
+            )
+            .with_for_update()
+        )
+        if execution is None:
+            return _booking_error_result("confirm_booking_action", BookingErrorCode.INVALID_INPUT)
+        if execution.status is not ToolExecutionStatus.STARTED:
+            stored = execution.sanitized_result
+            if isinstance(stored, Mapping) and stored.get("ok") is True:
+                return ConfirmationResult.model_validate(stored).model_copy(
+                    update={"replayed": True}
+                )
+            if isinstance(stored, Mapping):
+                return BookingErrorResult.model_validate(stored)
+            return _booking_error_result(
+                "confirm_booking_action",
+                BookingErrorCode.CALENDAR_RECONCILIATION_REQUIRED,
+                retryable=True,
+            )
+        state = execution.sanitized_result
+        if not isinstance(state, Mapping) or state.get("action_type") != expected_action_type.value:
+            return _booking_error_result(
+                "confirm_booking_action", BookingErrorCode.CALENDAR_RECONCILIATION_REQUIRED
+            )
+        booking_value = state.get("booking_id")
+        if not isinstance(booking_value, str):
+            return _booking_error_result(
+                "confirm_booking_action", BookingErrorCode.CALENDAR_RECONCILIATION_REQUIRED
+            )
+        try:
+            booking_id = UUID(booking_value)
+        except ValueError:
+            return _booking_error_result(
+                "confirm_booking_action", BookingErrorCode.CALENDAR_RECONCILIATION_REQUIRED
+            )
+        booking = await session.scalar(
+            select(Booking).where(Booking.id == booking_id).with_for_update()
+        )
+        payload = conversation.pending_action_payload
+        if (
+            booking is None
+            or booking.contact_id != contact.id
+            or conversation.pending_action_type is not expected_action_type
+            or conversation.pending_action_status is not PendingActionStatus.CONFIRMED
+            or not isinstance(payload, Mapping)
+            or payload.get("confirmation_execution_id") != str(execution.id)
+            or payload.get("action_token") != request.action_token
+        ):
+            return _booking_error_result(
+                "confirm_booking_action", BookingErrorCode.STALE_PENDING_ACTION
+            )
+        if booking.status is not BookingStatus.PENDING:
+            return _booking_error_result(
+                "confirm_booking_action", BookingErrorCode.BOOKING_STATE_CONFLICT
+            )
+        calendar_id = state.get("calendar_id")
+        event_id = state.get("calendar_event_id")
+        if not isinstance(calendar_id, str) or not isinstance(event_id, str):
+            return _managed_confirmation_failure(
+                session,
+                conversation=conversation,
+                execution=execution,
+                booking=booking,
+                state=state,
+                code=BookingErrorCode.EXTERNAL_REFERENCE_MISSING,
+                now=now,
+            )
+        if _calendar_id(calendar) != calendar_id:
+            return _managed_confirmation_failure(
+                session,
+                conversation=conversation,
+                execution=execution,
+                booking=booking,
+                state=state,
+                code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
+                now=now,
+            )
+
+        if expected_action_type is PendingActionType.RESCHEDULE_BOOKING:
+            desired = _state_interval(state, "desired")
+            try:
+                business_spec = _business_spec(business)
+                service = await session.get(Service, booking.service_id)
+                area_code = booking.booking_data.get("service_area_code")
+                if service is None or not isinstance(area_code, str):
+                    raise ValueError("managed booking configuration is unavailable")
+                area, area_error = _resolve_area(business_spec, area_code)
+                if area_error is not None or area is None:
+                    raise ValueError("managed booking area is unavailable")
+                policy = evaluate_booking_policy(business_spec, desired, now)
+            except ValueError:
+                return _managed_confirmation_failure(
+                    session,
+                    conversation=conversation,
+                    execution=execution,
+                    booking=booking,
+                    state=state,
+                    code=BookingErrorCode.STALE_PENDING_ACTION,
+                    now=now,
+                )
+            policy_error = _policy_error(policy)
+            if policy_error is not None:
+                return _managed_confirmation_failure(
+                    session,
+                    conversation=conversation,
+                    execution=execution,
+                    booking=booking,
+                    state=state,
+                    code=policy_error,
+                    now=now,
+                )
+            availability = await check_calendar_availability(
+                calendar,
+                calendar_id=calendar_id,
+                policy=policy,
+                exclude_event_id=event_id,
+            )
+            availability_error = _availability_error(availability)
+            if availability_error is not None:
+                if availability_error is BookingErrorCode.CALENDAR_INTERVAL_UNAVAILABLE:
+                    return _managed_confirmation_failure(
+                        session,
+                        conversation=conversation,
+                        execution=execution,
+                        booking=booking,
+                        state=state,
+                        code=availability_error,
+                        now=now,
+                    )
+                return _booking_error_result(
+                    "confirm_booking_action",
+                    availability_error,
+                    retryable=availability_error is BookingErrorCode.CALENDAR_UNAVAILABLE,
+                )
+        else:
+            desired = _state_interval(state, "desired")
+
+        event = await calendar.get_event(calendar_id, event_id)
+        if event is None:
+            if expected_action_type is PendingActionType.RESCHEDULE_BOOKING:
+                return _managed_confirmation_failure(
+                    session,
+                    conversation=conversation,
+                    execution=execution,
+                    booking=booking,
+                    state=state,
+                    code=BookingErrorCode.EXTERNAL_EVENT_MISSING,
+                    now=now,
+                )
+            return _managed_confirmation_success(
+                session,
+                conversation=conversation,
+                execution=execution,
+                booking=booking,
+                state=state,
+                action_type=expected_action_type,
+                now=now,
+            )
+        if not (
+            event.calendar_id == calendar_id
+            and event.event_id == event_id
+            and event.private_booking_id == str(booking.id)
+            and event.lifecycle is CalendarEventLifecycle.ACTIVE
+        ):
+            return _managed_confirmation_failure(
+                session,
+                conversation=conversation,
+                execution=execution,
+                booking=booking,
+                state=state,
+                code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
+                now=now,
+            )
+        if (
+            expected_action_type is PendingActionType.RESCHEDULE_BOOKING
+            and event.interval == CalendarInterval(desired.start_at_utc, desired.end_at_utc)
+        ):
+            return _managed_confirmation_success(
+                session,
+                conversation=conversation,
+                execution=execution,
+                booking=booking,
+                state=state,
+                action_type=expected_action_type,
+                now=now,
+            )
+        if expected_action_type is PendingActionType.CANCEL_BOOKING:
+            attempts = 0
+            while True:
+                try:
+                    await calendar.cancel_event(calendar_id, event_id, event.etag)
+                    break
+                except CalendarClientError as exc:
+                    latest = await calendar.get_event(calendar_id, event_id)
+                    if latest is None:
+                        break
+                    if not (
+                        latest.calendar_id == calendar_id
+                        and latest.event_id == event_id
+                        and latest.private_booking_id == str(booking.id)
+                        and latest.lifecycle is CalendarEventLifecycle.ACTIVE
+                    ):
+                        return _managed_confirmation_failure(
+                            session,
+                            conversation=conversation,
+                            execution=execution,
+                            booking=booking,
+                            state=state,
+                            code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
+                            now=now,
+                        )
+                    if (
+                        exc.code is CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED
+                        and attempts == 0
+                    ):
+                        attempts += 1
+                        event = latest
+                        continue
+                    if exc.code is CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED:
+                        return _booking_error_result(
+                            "confirm_booking_action",
+                            BookingErrorCode.CALENDAR_RECONCILIATION_REQUIRED,
+                            retryable=True,
+                        )
+                    return _managed_confirmation_failure(
+                        session,
+                        conversation=conversation,
+                        execution=execution,
+                        booking=booking,
+                        state=state,
+                        code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
+                        now=now,
+                    )
+            return _managed_confirmation_success(
+                session,
+                conversation=conversation,
+                execution=execution,
+                booking=booking,
+                state=state,
+                action_type=expected_action_type,
+                now=now,
+            )
+
+        prior = _state_interval(state, "prior")
+        if event.interval == CalendarInterval(prior.start_at_utc, prior.end_at_utc):
+            attempts = 0
+            while True:
+                try:
+                    event = await calendar.patch_event(
+                        calendar_id,
+                        event_id,
+                        CalendarEventPatch(
+                            interval=CalendarInterval(desired.start_at_utc, desired.end_at_utc)
+                        ),
+                        event.etag,
+                    )
+                    break
+                except CalendarClientError as exc:
+                    latest = await calendar.get_event(calendar_id, event_id)
+                    if latest is None:
+                        return _managed_confirmation_failure(
+                            session,
+                            conversation=conversation,
+                            execution=execution,
+                            booking=booking,
+                            state=state,
+                            code=BookingErrorCode.EXTERNAL_EVENT_MISSING,
+                            now=now,
+                        )
+                    if not (
+                        latest.calendar_id == calendar_id
+                        and latest.event_id == event_id
+                        and latest.private_booking_id == str(booking.id)
+                        and latest.lifecycle is CalendarEventLifecycle.ACTIVE
+                    ):
+                        return _managed_confirmation_failure(
+                            session,
+                            conversation=conversation,
+                            execution=execution,
+                            booking=booking,
+                            state=state,
+                            code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
+                            now=now,
+                        )
+                    if latest.interval == CalendarInterval(
+                        desired.start_at_utc, desired.end_at_utc
+                    ):
+                        return _managed_confirmation_success(
+                            session,
+                            conversation=conversation,
+                            execution=execution,
+                            booking=booking,
+                            state=state,
+                            action_type=expected_action_type,
+                            now=now,
+                        )
+                    if (
+                        exc.code is CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED
+                        and latest.interval
+                        == CalendarInterval(prior.start_at_utc, prior.end_at_utc)
+                        and attempts == 0
+                    ):
+                        attempts += 1
+                        event = latest
+                        continue
+                    if exc.code is CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED:
+                        return _booking_error_result(
+                            "confirm_booking_action",
+                            BookingErrorCode.CALENDAR_RECONCILIATION_REQUIRED,
+                            retryable=True,
+                        )
+                    return _managed_confirmation_failure(
+                        session,
+                        conversation=conversation,
+                        execution=execution,
+                        booking=booking,
+                        state=state,
+                        code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
+                        now=now,
+                    )
+        else:
+            return _managed_confirmation_failure(
+                session,
+                conversation=conversation,
+                execution=execution,
+                booking=booking,
+                state=state,
+                code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
+                now=now,
+            )
+        if not _event_matches_booking(
+            event,
+            calendar_id=calendar_id,
+            event_id=event_id,
+            booking_id=booking.id,
+            interval=desired,
+        ):
+            return _managed_confirmation_failure(
+                session,
+                conversation=conversation,
+                execution=execution,
+                booking=booking,
+                state=state,
+                code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
+                now=now,
+            )
+        return _managed_confirmation_success(
+            session,
+            conversation=conversation,
+            execution=execution,
+            booking=booking,
+            state=state,
+            action_type=expected_action_type,
+            now=now,
+        )
 def _create_confirmation_success(
     session: AsyncSession,
     *,
@@ -2113,17 +2785,40 @@ async def confirm_booking_action(
     now_utc: datetime,
 ) -> ConfirmationResult | BookingErrorResult:
     """Confirm the exact staged create action and reconcile its Calendar event."""
-    claimed = await _claim_create_confirmation(
-        session_factory,
-        calendar,
-        request,
-        now_utc=now_utc,
-    )
+    if request.action_type is PendingActionType.CREATE_BOOKING:
+        claimed = await _claim_create_confirmation(
+            session_factory,
+            calendar,
+            request,
+            now_utc=now_utc,
+        )
+    elif request.action_type is PendingActionType.RESCHEDULE_BOOKING:
+        claimed = await _claim_managed_booking_confirmation(
+            session_factory,
+            request,
+            expected_action_type=PendingActionType.RESCHEDULE_BOOKING,
+            now_utc=now_utc,
+        )
+    else:
+        claimed = await _claim_managed_booking_confirmation(
+            session_factory,
+            request,
+            expected_action_type=PendingActionType.CANCEL_BOOKING,
+            now_utc=now_utc,
+        )
     if claimed is not None:
         return claimed
-    return await _finalize_create_confirmation(
+    if request.action_type is PendingActionType.CREATE_BOOKING:
+        return await _finalize_create_confirmation(
+            session_factory,
+            calendar,
+            request,
+            now_utc=now_utc,
+        )
+    return await _finalize_managed_booking_confirmation(
         session_factory,
         calendar,
         request,
+        expected_action_type=request.action_type,
         now_utc=now_utc,
     )
