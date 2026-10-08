@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
@@ -30,13 +29,19 @@ from receptionist.application.booking import (
     prepare_create_booking,
     prepare_reschedule_booking,
 )
-from receptionist.core.config import AppEnvironment, LogLevel, Settings
+from receptionist.core.config import (
+    AppEnvironment,
+    LogLevel,
+    Settings,
+    assert_safe_test_database,
+)
 from receptionist.db.models import Contact, Conversation
 from receptionist.db.session import (
     create_database_resources,
     dispose_database,
 )
 from receptionist.domain.enums import (
+    BookingStatus,
     ControlMode,
     ConversationChannel,
     ConversationLanguageMode,
@@ -52,7 +57,7 @@ from receptionist.seed import seed_reference_data
 
 SMOKE_CONFIRMATION = "DEDICATED_NON_PRODUCTION_ONLY"
 SMOKE_ENVIRONMENT = "synthetic"
-_SMOKE_CALENDAR_PATTERN = re.compile(r"^smoke-[a-z0-9][a-z0-9.@_+\-]{4,127}$")
+_SECONDARY_CALENDAR_SUFFIX = "@group.calendar.google.com"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 
 
@@ -77,7 +82,15 @@ class SmokeRunResult:
     """Opaque local identity needed for exact cleanup."""
 
     booking_id: UUID
+    calendar_id: str
     calendar_event_id: str
+
+
+@dataclass(slots=True)
+class SmokeRunTracker:
+    """Mutable exact identity captured as soon as create is reconciled."""
+
+    result: SmokeRunResult | None = None
 
 
 def _required(environment: Mapping[str, str], name: str) -> str:
@@ -90,18 +103,21 @@ def _required(environment: Mapping[str, str], name: str) -> str:
 def build_smoke_configuration(environment: Mapping[str, str]) -> SmokeConfiguration:
     """Validate all smoke guards before constructing a provider client."""
     app_env = environment.get("RECEPTIONIST_APP_ENV", "").strip()
-    if app_env == "production":
-        raise SmokeGuardError("production application environment is not permitted")
-    if app_env not in {"local", "test", "ci"}:
-        raise SmokeGuardError("an explicit non-production application environment is required")
+    if app_env != "test":
+        raise SmokeGuardError("smoke requires the test application environment")
     if environment.get("RECEPTIONIST_CALENDAR_SMOKE_ENV", "").strip() != SMOKE_ENVIRONMENT:
         raise SmokeGuardError("explicit synthetic smoke environment is required")
     if environment.get("RECEPTIONIST_CALENDAR_SMOKE_CONFIRM", "").strip() != SMOKE_CONFIRMATION:
         raise SmokeGuardError("explicit smoke confirmation is required")
 
     calendar_id = environment.get("RECEPTIONIST_CALENDAR_SMOKE_CALENDAR_ID", "").strip()
-    if not _SMOKE_CALENDAR_PATTERN.fullmatch(calendar_id):
-        raise SmokeGuardError("dedicated smoke Calendar ID must use the smoke- prefix")
+    if (
+        not calendar_id
+        or calendar_id == "primary"
+        or not calendar_id.endswith(_SECONDARY_CALENDAR_SUFFIX)
+        or not calendar_id.removesuffix(_SECONDARY_CALENDAR_SUFFIX)
+    ):
+        raise SmokeGuardError("dedicated secondary Calendar ID is required")
     if calendar_id == environment.get("RECEPTIONIST_GOOGLE_CALENDAR_ID", "").strip():
         raise SmokeGuardError("smoke Calendar ID must be separate from the runtime Calendar ID")
 
@@ -125,6 +141,10 @@ def build_smoke_configuration(environment: Mapping[str, str]) -> SmokeConfigurat
         )
     except (TypeError, ValueError, ValidationError) as exc:
         raise SmokeGuardError("required smoke runtime settings are invalid") from exc
+    try:
+        assert_safe_test_database(settings)
+    except RuntimeError as exc:
+        raise SmokeGuardError(str(exc)) from exc
     if not settings.google_calendar_configured:
         raise SmokeGuardError("dedicated Calendar credentials unavailable")
     return SmokeConfiguration(calendar_id=calendar_id, settings=settings)
@@ -154,6 +174,7 @@ async def run_smoke_operations(
     *,
     conversation_id: UUID,
     now_utc: datetime,
+    tracker: SmokeRunTracker | None = None,
 ) -> SmokeRunResult:
     """Exercise the existing finite booking operations in the smoke sequence."""
     create_start, create_end = _smoke_interval_after(now_utc)
@@ -193,13 +214,25 @@ async def run_smoke_operations(
         raise SmokeWorkflowError("same-key confirmation replay was not observed")
 
     booking_id = confirmed.data.booking_id
+    calendar_id = confirmed.data.calendar_id
     event_id = confirmed.data.calendar_event_id
-    if event_id is None:
+    if calendar_id is None or event_id is None:
         raise SmokeWorkflowError("confirmed smoke booking has no Calendar event identity")
+    smoke_result = SmokeRunResult(
+        booking_id=booking_id,
+        calendar_id=calendar_id,
+        calendar_event_id=event_id,
+    )
+    if tracker is not None:
+        tracker.result = smoke_result
     read = await _read_booking(
         session_factory, calendar, conversation_id=conversation_id, booking_id=booking_id
     )
-    if not isinstance(read, BookingReadResult) or read.data.reconciliation_status != "in_sync":
+    if (
+        not isinstance(read, BookingReadResult)
+        or read.data.status is not BookingStatus.CONFIRMED
+        or read.data.reconciliation_status != "in_sync"
+    ):
         raise SmokeWorkflowError("created smoke booking did not reconcile")
 
     prepared_reschedule = await prepare_reschedule_booking(
@@ -229,6 +262,17 @@ async def run_smoke_operations(
     )
     if not isinstance(rescheduled, ConfirmationResult):
         raise SmokeWorkflowError("synthetic reschedule confirmation was rejected")
+    rescheduled_read = await _read_booking(
+        session_factory, calendar, conversation_id=conversation_id, booking_id=booking_id
+    )
+    if (
+        not isinstance(rescheduled_read, BookingReadResult)
+        or rescheduled_read.data.status is not BookingStatus.CONFIRMED
+        or rescheduled_read.data.start_at_utc != reschedule_start
+        or rescheduled_read.data.end_at_utc != reschedule_end
+        or rescheduled_read.data.reconciliation_status != "in_sync"
+    ):
+        raise SmokeWorkflowError("rescheduled smoke booking did not reconcile")
 
     prepared_cancel = await prepare_cancel_booking(
         session_factory,
@@ -256,9 +300,13 @@ async def run_smoke_operations(
     final_read = await _read_booking(
         session_factory, calendar, conversation_id=conversation_id, booking_id=booking_id
     )
-    if not isinstance(final_read, BookingReadResult) or final_read.data.status.value != "cancelled":
+    if (
+        not isinstance(final_read, BookingReadResult)
+        or final_read.data.status is not BookingStatus.CANCELLED
+        or final_read.data.reconciliation_status != "in_sync"
+    ):
         raise SmokeWorkflowError("cancelled smoke booking did not reconcile")
-    return SmokeRunResult(booking_id=booking_id, calendar_event_id=event_id)
+    return smoke_result
 
 
 async def _read_booking(
@@ -321,26 +369,27 @@ async def _create_smoke_conversation(
 async def run_smoke(configuration: SmokeConfiguration) -> None:
     """Construct the real client only after guards and execute the bounded flow."""
     resources = create_database_resources(configuration.settings)
-    calendar = GoogleCalendarClient.from_settings(configuration.settings)
-    smoke_result: SmokeRunResult | None = None
     try:
-        conversation_id = await _create_smoke_conversation(
-            resources.session_factory, configuration.settings.app_env
-        )
+        calendar = GoogleCalendarClient.from_settings(configuration.settings)
+        tracker = SmokeRunTracker()
         try:
-            smoke_result = await run_smoke_operations(
+            conversation_id = await _create_smoke_conversation(
+                resources.session_factory, configuration.settings.app_env
+            )
+            await run_smoke_operations(
                 resources.session_factory,
                 calendar,
                 conversation_id=conversation_id,
                 now_utc=datetime.now(UTC),
+                tracker=tracker,
             )
         finally:
-            if smoke_result is not None:
+            if tracker.result is not None:
                 await _cleanup_exact_event(
                     calendar,
-                    calendar_id=configuration.calendar_id,
-                    event_id=smoke_result.calendar_event_id,
-                    booking_id=smoke_result.booking_id,
+                    calendar_id=tracker.result.calendar_id,
+                    event_id=tracker.result.calendar_event_id,
+                    booking_id=tracker.result.booking_id,
                 )
     finally:
         await dispose_database(resources)

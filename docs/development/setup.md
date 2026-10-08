@@ -66,7 +66,7 @@ Phase 2 includes a manual-only Calendar smoke path for a dedicated non-productio
 - `https://www.googleapis.com/auth/calendar.events`
 - `https://www.googleapis.com/auth/calendar.freebusy`
 
-The application does not provide an OAuth consent UI or write credentials to disk. Set the existing Google credential variables plus `RECEPTIONIST_APP_ENV=test` (or another non-production environment), `RECEPTIONIST_CALENDAR_SMOKE_ENV=synthetic`, `RECEPTIONIST_CALENDAR_SMOKE_CONFIRM=DEDICATED_NON_PRODUCTION_ONLY`, and a dedicated Calendar ID beginning with `smoke-` in `RECEPTIONIST_CALENDAR_SMOKE_CALENDAR_ID`. The smoke ID is required separately; it never falls back to `RECEPTIONIST_GOOGLE_CALENDAR_ID`.
+The application does not provide an OAuth consent UI or write credentials to disk. Create a dedicated Google secondary Calendar with an obvious human-visible name such as `Receptionist Phase 2 Smoke`, then copy its provider-assigned Calendar ID from Google Calendar settings. A normal secondary Calendar ID ends with `@group.calendar.google.com`; do not use `primary`, an account email, or the runtime Calendar ID. Set the existing Google credential variables plus `RECEPTIONIST_APP_ENV=test`, `RECEPTIONIST_CALENDAR_SMOKE_ENV=synthetic`, `RECEPTIONIST_CALENDAR_SMOKE_CONFIRM=DEDICATED_NON_PRODUCTION_ONLY`, `RECEPTIONIST_CALENDAR_SMOKE_CALENDAR_ID=<the-secondary-calendar-id>`, and a database URL whose database name is exactly `receptionist_test`. The smoke ID is required separately; it never falls back to `RECEPTIONIST_GOOGLE_CALENDAR_ID`.
 
 Run only when the dedicated Calendar and credentials are intentionally provisioned:
 
