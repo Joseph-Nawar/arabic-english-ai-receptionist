@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from enum import StrEnum
@@ -294,11 +295,23 @@ class GoogleCalendarClient:
         missing_code: CalendarErrorCode | None = None,
         is_write: bool = False,
     ) -> Any:
+        worker = asyncio.create_task(
+            asyncio.to_thread(lambda: request_factory().execute(num_retries=0))
+        )
         try:
-            execution = asyncio.to_thread(lambda: request_factory().execute(num_retries=0))
             if is_write:
-                return await execution
-            return await asyncio.wait_for(execution, timeout=self._timeout)
+                try:
+                    return await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    while not worker.done():
+                        try:
+                            await asyncio.shield(worker)
+                        except asyncio.CancelledError:
+                            continue
+                    with suppress(BaseException):
+                        worker.result()
+                    raise
+            return await asyncio.wait_for(worker, timeout=self._timeout)
         except TimeoutError as exc:
             code = (
                 CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED

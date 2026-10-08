@@ -348,14 +348,19 @@ async def test_write_timeout_requires_reconciliation(monkeypatch, operation: str
     assert "provider-body" not in str(exc_info.value)
 
 
-async def test_write_execution_waits_for_worker_after_shorter_caller_deadline(monkeypatch) -> None:
+async def test_write_execution_waits_for_cancelled_caller_until_worker_finishes(
+    monkeypatch,
+) -> None:
     worker_started = asyncio.Event()
+    worker_finished = asyncio.Event()
     release_worker = asyncio.Event()
 
     async def delayed_to_thread(function, *args, **kwargs):
         worker_started.set()
         await release_worker.wait()
-        return function(*args, **kwargs)
+        result = function(*args, **kwargs)
+        worker_finished.set()
+        return result
 
     monkeypatch.setattr(google_calendar.asyncio, "to_thread", delayed_to_thread)
     client = _client(_Service(_FreeBusyResource({}), _EventsResource([{}])))
@@ -363,12 +368,14 @@ async def test_write_execution_waits_for_worker_after_shorter_caller_deadline(mo
     task = asyncio.create_task(client._execute(lambda: request, is_write=True))
 
     await asyncio.wait_for(worker_started.wait(), timeout=1)
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(asyncio.shield(task), timeout=0.01)
+    task.cancel()
     assert not task.done()
+    assert not worker_finished.is_set()
 
     release_worker.set()
-    assert await task == {"ok": True}
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert worker_finished.is_set()
 
 
 async def test_create_transport_failure_requires_reconciliation() -> None:

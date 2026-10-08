@@ -31,11 +31,14 @@ class DeterministicCalendarDouble:
         ambiguous_create_before_success: bool = False,
         ambiguous_create_after_success: bool = False,
         crash_after_create_success: bool = False,
+        create_errors: Iterable[CalendarClientError] = (),
         foreign_marker_event_ids: set[str] | None = None,
         foreign_marker: bool = False,
         ambiguous_patch_after_success: bool = False,
         crash_after_patch_success: bool = False,
+        patch_errors: Iterable[CalendarClientError] = (),
         ambiguous_cancel_after_success: bool = False,
+        cancel_errors: Iterable[CalendarClientError] = (),
         get_event_errors: Iterable[CalendarClientError | None] = (),
     ) -> None:
         self.calendar_id = calendar_id
@@ -45,11 +48,14 @@ class DeterministicCalendarDouble:
         self._ambiguous_create_before_success = ambiguous_create_before_success
         self._ambiguous_create_after_success = ambiguous_create_after_success
         self._crash_after_create_success = crash_after_create_success
+        self._create_errors = list(create_errors)
         self._foreign_marker_event_ids = foreign_marker_event_ids or set()
         self._foreign_marker = foreign_marker
         self._ambiguous_patch_after_success = ambiguous_patch_after_success
         self._crash_after_patch_success = crash_after_patch_success
+        self._patch_errors = list(patch_errors)
         self._ambiguous_cancel_after_success = ambiguous_cancel_after_success
+        self._cancel_errors = list(cancel_errors)
         self._get_event_errors = list(get_event_errors)
         self._events: dict[tuple[str, str], CalendarEventSnapshot] = {}
         self._etag_counter = 0
@@ -121,6 +127,8 @@ class DeterministicCalendarDouble:
                 "Calendar write result requires reconciliation",
                 retryable=True,
             )
+        if self._create_errors:
+            raise self._create_errors.pop(0)
         if key in self._events:
             raise CalendarClientError(
                 CalendarErrorCode.EXTERNAL_STATE_CONFLICT,
@@ -179,6 +187,8 @@ class DeterministicCalendarDouble:
                 "the Calendar event changed",
                 retryable=True,
             )
+        if self._patch_errors:
+            raise self._patch_errors.pop(0)
         updated = CalendarEventSnapshot(
             calendar_id=calendar_id,
             event_id=event_id,
@@ -219,6 +229,8 @@ class DeterministicCalendarDouble:
                 "the Calendar event changed",
                 retryable=True,
             )
+        if self._cancel_errors:
+            raise self._cancel_errors.pop(0)
         del self._events[(calendar_id, event_id)]
         if self._ambiguous_cancel_after_success:
             self._ambiguous_cancel_after_success = False

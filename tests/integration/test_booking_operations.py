@@ -1388,6 +1388,133 @@ async def test_confirm_create_recovers_after_crash_following_provider_success(
         )
 
 
+async def test_create_recovery_reconciles_provider_before_changed_policy(
+    session_factory,
+) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double(crash_after_create_success=True)
+    preparation = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"prepare-create-policy-recovery-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+    request = ConfirmBookingActionRequest(
+        conversation_id=conversation_id,
+        action_type=preparation.data.action_type,
+        action_token=preparation.data.action_token,
+        idempotency_key=f"confirm-create-policy-recovery-{uuid.uuid4()}",
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await confirm_booking_action(session_factory, calendar, request, now_utc=NOW_UTC)
+
+    async with session_factory.begin() as session:
+        business = await session.get(BusinessConfig, 1)
+        assert business is not None
+        original_policy = dict(business.booking_policy)
+        business.booking_policy = {
+            **business.booking_policy,
+            "minimum_notice_minutes": 999999,
+        }
+    calendar.mutation_calls.clear()
+
+    try:
+        recovered = await confirm_booking_action(
+            session_factory, calendar, request, now_utc=NOW_UTC
+        )
+        assert isinstance(recovered, ConfirmationResult)
+        assert calendar.mutation_calls == []
+    finally:
+        async with session_factory.begin() as session:
+            business = await session.get(BusinessConfig, 1)
+            assert business is not None
+            business.booking_policy = original_policy
+
+
+async def test_create_recovery_uses_persisted_calendar_after_configuration_change(
+    session_factory,
+) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double(crash_after_create_success=True)
+    preparation = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"prepare-create-calendar-recovery-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+    request = ConfirmBookingActionRequest(
+        conversation_id=conversation_id,
+        action_type=preparation.data.action_type,
+        action_token=preparation.data.action_token,
+        idempotency_key=f"confirm-create-calendar-recovery-{uuid.uuid4()}",
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await confirm_booking_action(session_factory, calendar, request, now_utc=NOW_UTC)
+
+    calendar.calendar_id = "new-default-calendar"
+    calendar.mutation_calls.clear()
+
+    recovered = await confirm_booking_action(session_factory, calendar, request, now_utc=NOW_UTC)
+
+    assert isinstance(recovered, ConfirmationResult)
+    assert calendar.mutation_calls == []
+
+
+async def test_create_recovery_absent_event_and_changed_calendar_rejects_without_create(
+    session_factory,
+) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double(
+        create_errors=[
+            CalendarClientError(
+                CalendarErrorCode.CALENDAR_UNAVAILABLE,
+                "provider-body",
+                retryable=True,
+            )
+        ]
+    )
+    preparation = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"prepare-create-calendar-mismatch-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+    request = ConfirmBookingActionRequest(
+        conversation_id=conversation_id,
+        action_type=preparation.data.action_type,
+        action_token=preparation.data.action_token,
+        idempotency_key=f"confirm-create-calendar-mismatch-{uuid.uuid4()}",
+    )
+
+    first = await confirm_booking_action(session_factory, calendar, request, now_utc=NOW_UTC)
+    assert isinstance(first, BookingErrorResult)
+    assert first.error.code is BookingErrorCode.CALENDAR_UNAVAILABLE
+    calendar.calendar_id = "new-default-calendar"
+    calendar.mutation_calls.clear()
+
+    result = await confirm_booking_action(session_factory, calendar, request, now_utc=NOW_UTC)
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.EXTERNAL_STATE_CONFLICT
+    assert calendar.mutation_calls == []
+    async with session_factory() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        assert conversation is not None
+        booking = await session.scalar(
+            select(Booking).where(Booking.contact_id == conversation.contact_id)
+        )
+        assert booking is not None
+        assert booking.status is BookingStatus.CANCELLED
+        assert booking.calendar_id is None
+        assert booking.calendar_event_id is None
+        assert conversation.pending_action_type is None
+
+
 async def test_create_initial_reconciliation_read_failure_is_bounded_and_recoverable(
     session_factory,
 ) -> None:
@@ -1478,6 +1605,97 @@ async def test_create_ambiguous_reconciliation_read_failure_stays_started(
         assert booking.status is BookingStatus.PENDING
         assert execution.status is ToolExecutionStatus.STARTED
         assert conversation.pending_action_status is PendingActionStatus.CONFIRMED
+
+
+async def test_create_retryable_calendar_error_stays_recoverable(session_factory) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double(
+        create_errors=[
+            CalendarClientError(
+                CalendarErrorCode.CALENDAR_UNAVAILABLE,
+                "provider-body",
+                retryable=True,
+            )
+        ]
+    )
+    preparation = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"prepare-create-calendar-unavailable-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+    request = ConfirmBookingActionRequest(
+        conversation_id=conversation_id,
+        action_type=preparation.data.action_type,
+        action_token=preparation.data.action_token,
+        idempotency_key=f"confirm-create-calendar-unavailable-{uuid.uuid4()}",
+    )
+
+    result = await confirm_booking_action(session_factory, calendar, request, now_utc=NOW_UTC)
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.CALENDAR_UNAVAILABLE
+    assert result.error.retryable is True
+    assert "provider-body" not in str(result)
+    async with session_factory() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        assert conversation is not None
+        booking = await session.scalar(
+            select(Booking).where(Booking.contact_id == conversation.contact_id)
+        )
+        assert booking is not None
+        assert booking.status is BookingStatus.PENDING
+        assert booking.calendar_id == CALENDAR_ID
+        assert booking.calendar_event_id is not None
+        assert conversation.pending_action_status is PendingActionStatus.CONFIRMED
+
+
+async def test_create_nonretryable_calendar_error_cancels_uncreated_intent(
+    session_factory,
+) -> None:
+    _, conversation_id, _ = await _operation_context(session_factory)
+    calendar = _calendar_double(
+        create_errors=[
+            CalendarClientError(
+                CalendarErrorCode.CALENDAR_UNAVAILABLE,
+                "provider-body",
+                retryable=False,
+            )
+        ]
+    )
+    preparation = await prepare_create_booking(
+        session_factory,
+        calendar,
+        _create_request(conversation_id, f"prepare-create-calendar-rejected-{uuid.uuid4()}"),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+    request = ConfirmBookingActionRequest(
+        conversation_id=conversation_id,
+        action_type=preparation.data.action_type,
+        action_token=preparation.data.action_token,
+        idempotency_key=f"confirm-create-calendar-rejected-{uuid.uuid4()}",
+    )
+
+    result = await confirm_booking_action(session_factory, calendar, request, now_utc=NOW_UTC)
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.CALENDAR_UNAVAILABLE
+    assert result.error.retryable is False
+    assert "provider-body" not in str(result)
+    assert len(calendar.mutation_calls) == 1
+    async with session_factory() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        assert conversation is not None
+        booking = await session.scalar(
+            select(Booking).where(Booking.contact_id == conversation.contact_id)
+        )
+        assert booking is not None
+        assert booking.status is BookingStatus.CANCELLED
+        assert booking.calendar_id is None
+        assert booking.calendar_event_id is None
+        assert conversation.pending_action_type is None
 
 
 async def _seed_calendar_event_for_booking(
@@ -1603,6 +1821,230 @@ async def test_reschedule_ambiguous_patch_reconciliation_read_failure_stays_star
         assert booking.status is BookingStatus.PENDING
         assert execution.status is ToolExecutionStatus.STARTED
         assert conversation.pending_action_status is PendingActionStatus.CONFIRMED
+
+
+async def test_reschedule_retryable_calendar_error_preserves_started_state(
+    session_factory,
+) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    calendar = _calendar_double(
+        patch_errors=[
+            CalendarClientError(
+                CalendarErrorCode.CALENDAR_UNAVAILABLE,
+                "provider-body",
+                retryable=True,
+            )
+        ]
+    )
+    event_id = await _seed_calendar_event_for_booking(session_factory, calendar, booking_id)
+    requested_start = REQUESTED_START + timedelta(hours=1)
+    preparation = await prepare_reschedule_booking(
+        session_factory,
+        calendar,
+        RescheduleBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            requested_start_at=requested_start,
+            idempotency_key=f"prepare-reschedule-calendar-unavailable-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=PendingActionType.RESCHEDULE_BOOKING,
+            action_token=preparation.data.action_token,
+            idempotency_key=f"confirm-reschedule-calendar-unavailable-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.CALENDAR_UNAVAILABLE
+    assert result.error.retryable is True
+    assert "provider-body" not in str(result)
+    event = await calendar.get_event(CALENDAR_ID, event_id)
+    assert event is not None
+    assert event.interval == CalendarInterval(REQUESTED_START, REQUESTED_END)
+    async with session_factory() as session:
+        booking = await session.get(Booking, booking_id)
+        conversation = await session.get(Conversation, conversation_id)
+        assert booking is not None
+        assert conversation is not None
+        assert booking.status is BookingStatus.PENDING
+        assert conversation.pending_action_status is PendingActionStatus.CONFIRMED
+
+
+async def test_reschedule_nonretryable_calendar_error_restores_confirmed_state(
+    session_factory,
+) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    calendar = _calendar_double(
+        patch_errors=[
+            CalendarClientError(
+                CalendarErrorCode.CALENDAR_UNAVAILABLE,
+                "provider-body",
+                retryable=False,
+            )
+        ]
+    )
+    event_id = await _seed_calendar_event_for_booking(session_factory, calendar, booking_id)
+    requested_start = REQUESTED_START + timedelta(hours=1)
+    preparation = await prepare_reschedule_booking(
+        session_factory,
+        calendar,
+        RescheduleBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            requested_start_at=requested_start,
+            idempotency_key=f"prepare-reschedule-calendar-rejected-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+    assert isinstance(preparation, PreparationResult)
+
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=PendingActionType.RESCHEDULE_BOOKING,
+            action_token=preparation.data.action_token,
+            idempotency_key=f"confirm-reschedule-calendar-rejected-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.CALENDAR_UNAVAILABLE
+    assert result.error.retryable is False
+    assert "provider-body" not in str(result)
+    event = await calendar.get_event(CALENDAR_ID, event_id)
+    assert event is not None
+    assert event.interval == CalendarInterval(REQUESTED_START, REQUESTED_END)
+    async with session_factory() as session:
+        booking = await session.get(Booking, booking_id)
+        conversation = await session.get(Conversation, conversation_id)
+        assert booking is not None
+        assert conversation is not None
+        assert booking.status is BookingStatus.CONFIRMED
+        assert booking.start_at == REQUESTED_START
+        assert booking.end_at == REQUESTED_END
+        assert conversation.pending_action_type is None
+
+
+async def test_cancel_retryable_calendar_error_preserves_started_state(session_factory) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    calendar = _calendar_double(
+        cancel_errors=[
+            CalendarClientError(
+                CalendarErrorCode.CALENDAR_UNAVAILABLE,
+                "provider-body",
+                retryable=True,
+            )
+        ]
+    )
+    event_id = await _seed_calendar_event_for_booking(session_factory, calendar, booking_id)
+    preparation = await prepare_cancel_booking(
+        session_factory,
+        CancelBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            idempotency_key=f"prepare-cancel-calendar-unavailable-{uuid.uuid4()}",
+        ),
+    )
+    assert isinstance(preparation, PreparationResult)
+
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=PendingActionType.CANCEL_BOOKING,
+            action_token=preparation.data.action_token,
+            idempotency_key=f"confirm-cancel-calendar-unavailable-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.CALENDAR_UNAVAILABLE
+    assert result.error.retryable is True
+    assert "provider-body" not in str(result)
+    event = await calendar.get_event(CALENDAR_ID, event_id)
+    assert event is not None
+    async with session_factory() as session:
+        booking = await session.get(Booking, booking_id)
+        conversation = await session.get(Conversation, conversation_id)
+        assert booking is not None
+        assert conversation is not None
+        assert booking.status is BookingStatus.PENDING
+        assert conversation.pending_action_status is PendingActionStatus.CONFIRMED
+
+
+async def test_cancel_nonretryable_calendar_error_restores_confirmed_state(session_factory) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    calendar = _calendar_double(
+        cancel_errors=[
+            CalendarClientError(
+                CalendarErrorCode.CALENDAR_UNAVAILABLE,
+                "provider-body",
+                retryable=False,
+            )
+        ]
+    )
+    event_id = await _seed_calendar_event_for_booking(session_factory, calendar, booking_id)
+    preparation = await prepare_cancel_booking(
+        session_factory,
+        CancelBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            idempotency_key=f"prepare-cancel-calendar-rejected-{uuid.uuid4()}",
+        ),
+    )
+    assert isinstance(preparation, PreparationResult)
+
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=PendingActionType.CANCEL_BOOKING,
+            action_token=preparation.data.action_token,
+            idempotency_key=f"confirm-cancel-calendar-rejected-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, BookingErrorResult)
+    assert result.error.code is BookingErrorCode.CALENDAR_UNAVAILABLE
+    assert result.error.retryable is False
+    assert "provider-body" not in str(result)
+    event = await calendar.get_event(CALENDAR_ID, event_id)
+    assert event is not None
+    async with session_factory() as session:
+        booking = await session.get(Booking, booking_id)
+        conversation = await session.get(Conversation, conversation_id)
+        assert booking is not None
+        assert conversation is not None
+        assert booking.status is BookingStatus.CONFIRMED
+        assert conversation.pending_action_type is None
 
 
 async def test_cancel_reconciliation_read_failure_stays_started(session_factory) -> None:

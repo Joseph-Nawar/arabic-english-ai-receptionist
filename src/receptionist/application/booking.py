@@ -1803,6 +1803,22 @@ async def _finalize_managed_booking_confirmation(
                             action_type=expected_action_type,
                             now=now,
                         )
+                    if exc.code is CalendarErrorCode.CALENDAR_UNAVAILABLE:
+                        if exc.retryable:
+                            return _booking_error_result(
+                                "confirm_booking_action",
+                                BookingErrorCode.CALENDAR_UNAVAILABLE,
+                                retryable=True,
+                            )
+                        return _managed_confirmation_failure(
+                            session,
+                            conversation=conversation,
+                            execution=execution,
+                            booking=booking,
+                            state=state,
+                            code=BookingErrorCode.CALENDAR_UNAVAILABLE,
+                            now=now,
+                        )
                     if (
                         exc.code is CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED
                         and latest.interval == prior_calendar_interval
@@ -1885,6 +1901,22 @@ async def _finalize_managed_booking_confirmation(
                         booking=booking,
                         state=state,
                         code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
+                        now=now,
+                    )
+                if exc.code is CalendarErrorCode.CALENDAR_UNAVAILABLE:
+                    if exc.retryable:
+                        return _booking_error_result(
+                            "confirm_booking_action",
+                            BookingErrorCode.CALENDAR_UNAVAILABLE,
+                            retryable=True,
+                        )
+                    return _managed_confirmation_failure(
+                        session,
+                        conversation=conversation,
+                        execution=execution,
+                        booking=booking,
+                        state=state,
+                        code=BookingErrorCode.CALENDAR_UNAVAILABLE,
                         now=now,
                     )
                 if exc.code is CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED and attempts == 0:
@@ -2060,6 +2092,46 @@ async def _finalize_create_confirmation(
             )
         interval = RequestedInterval(booking.start_at, booking.end_at)
         try:
+            existing = await calendar.get_event(calendar_id, event_id)
+        except CalendarClientError as exc:
+            return _calendar_read_error(exc)
+        if existing is not None:
+            if _event_matches_booking(
+                existing,
+                calendar_id=calendar_id,
+                event_id=event_id,
+                booking_id=booking.id,
+                interval=interval,
+            ):
+                return _create_confirmation_success(
+                    session,
+                    conversation=conversation,
+                    execution=execution,
+                    booking=booking,
+                    event_id=event_id,
+                    now=now,
+                )
+            return _cancel_uncreated_booking(
+                session,
+                conversation=conversation,
+                execution=execution,
+                booking=booking,
+                code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
+                now=now,
+                clear_references=False,
+            )
+
+        if _calendar_id(calendar) != calendar_id:
+            return _cancel_uncreated_booking(
+                session,
+                conversation=conversation,
+                execution=execution,
+                booking=booking,
+                code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
+                now=now,
+                clear_references=True,
+            )
+        try:
             business_spec = _business_spec(business)
             service = await session.get(Service, booking.service_id)
             area_code = booking.booking_data.get("service_area_code")
@@ -2088,46 +2160,6 @@ async def _finalize_create_confirmation(
                 code=BookingErrorCode.STALE_PENDING_ACTION,
                 now=now,
                 clear_references=True,
-            )
-        if _calendar_id(calendar) != calendar_id:
-            return _cancel_uncreated_booking(
-                session,
-                conversation=conversation,
-                execution=execution,
-                booking=booking,
-                code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
-                now=now,
-                clear_references=False,
-            )
-
-        try:
-            existing = await calendar.get_event(calendar_id, event_id)
-        except CalendarClientError as exc:
-            return _calendar_read_error(exc)
-        if existing is not None:
-            if _event_matches_booking(
-                existing,
-                calendar_id=calendar_id,
-                event_id=event_id,
-                booking_id=booking.id,
-                interval=interval,
-            ):
-                return _create_confirmation_success(
-                    session,
-                    conversation=conversation,
-                    execution=execution,
-                    booking=booking,
-                    event_id=event_id,
-                    now=now,
-                )
-            return _cancel_uncreated_booking(
-                session,
-                conversation=conversation,
-                execution=execution,
-                booking=booking,
-                code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
-                now=now,
-                clear_references=False,
             )
 
         availability = await check_calendar_availability(
@@ -2163,6 +2195,7 @@ async def _finalize_create_confirmation(
             if exc.code not in {
                 CalendarErrorCode.CALENDAR_RECONCILIATION_REQUIRED,
                 CalendarErrorCode.EXTERNAL_STATE_CONFLICT,
+                CalendarErrorCode.CALENDAR_UNAVAILABLE,
             }:
                 return _booking_error_result(
                     "confirm_booking_action",
@@ -2208,6 +2241,22 @@ async def _finalize_create_confirmation(
                     now=now,
                     clear_references=False,
                 )
+            if exc.code is CalendarErrorCode.CALENDAR_UNAVAILABLE:
+                if exc.retryable:
+                    return _booking_error_result(
+                        "confirm_booking_action",
+                        BookingErrorCode.CALENDAR_UNAVAILABLE,
+                        retryable=True,
+                    )
+                return _cancel_uncreated_booking(
+                    session,
+                    conversation=conversation,
+                    execution=execution,
+                    booking=booking,
+                    code=BookingErrorCode.CALENDAR_UNAVAILABLE,
+                    now=now,
+                    clear_references=True,
+                )
             try:
                 created = await calendar.create_event(calendar_id, event_id, event_request)
             except CalendarClientError as retry_error:
@@ -2216,6 +2265,22 @@ async def _finalize_create_confirmation(
                         "confirm_booking_action",
                         BookingErrorCode.CALENDAR_RECONCILIATION_REQUIRED,
                         retryable=True,
+                    )
+                if retry_error.code is CalendarErrorCode.CALENDAR_UNAVAILABLE:
+                    if retry_error.retryable:
+                        return _booking_error_result(
+                            "confirm_booking_action",
+                            BookingErrorCode.CALENDAR_UNAVAILABLE,
+                            retryable=True,
+                        )
+                    return _cancel_uncreated_booking(
+                        session,
+                        conversation=conversation,
+                        execution=execution,
+                        booking=booking,
+                        code=BookingErrorCode.CALENDAR_UNAVAILABLE,
+                        now=now,
+                        clear_references=True,
                     )
                 return _cancel_uncreated_booking(
                     session,
