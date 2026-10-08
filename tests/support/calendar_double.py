@@ -38,6 +38,7 @@ class DeterministicCalendarDouble:
         crash_after_patch_success: bool = False,
         patch_errors: Iterable[CalendarClientError] = (),
         ambiguous_cancel_after_success: bool = False,
+        crash_after_cancel_success: bool = False,
         cancel_errors: Iterable[CalendarClientError] = (),
         get_event_errors: Iterable[CalendarClientError | None] = (),
     ) -> None:
@@ -55,12 +56,14 @@ class DeterministicCalendarDouble:
         self._crash_after_patch_success = crash_after_patch_success
         self._patch_errors = list(patch_errors)
         self._ambiguous_cancel_after_success = ambiguous_cancel_after_success
+        self._crash_after_cancel_success = crash_after_cancel_success
         self._cancel_errors = list(cancel_errors)
         self._get_event_errors = list(get_event_errors)
         self._events: dict[tuple[str, str], CalendarEventSnapshot] = {}
         self._etag_counter = 0
         self.free_busy_queries: list[tuple[str, datetime, datetime]] = []
         self.conflict_queries: list[tuple[str, datetime, datetime, str | None]] = []
+        self.get_event_calls: list[tuple[str, str]] = []
         self.mutation_calls: list[tuple[str, str, str]] = []
 
     def _next_etag(self) -> str:
@@ -104,6 +107,7 @@ class DeterministicCalendarDouble:
         return tuple(conflicts)
 
     async def get_event(self, calendar_id: str, event_id: str) -> CalendarEventSnapshot | None:
+        self.get_event_calls.append((calendar_id, event_id))
         if self._get_event_errors:
             error = self._get_event_errors.pop(0)
             if error is not None:
@@ -232,6 +236,9 @@ class DeterministicCalendarDouble:
         if self._cancel_errors:
             raise self._cancel_errors.pop(0)
         del self._events[(calendar_id, event_id)]
+        if self._crash_after_cancel_success:
+            self._crash_after_cancel_success = False
+            raise RuntimeError("simulated crash after Calendar cancel")
         if self._ambiguous_cancel_after_success:
             self._ambiguous_cancel_after_success = False
             raise CalendarClientError(

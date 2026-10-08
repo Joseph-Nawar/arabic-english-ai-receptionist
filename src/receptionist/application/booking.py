@@ -1553,16 +1553,6 @@ async def _finalize_managed_booking_confirmation(
                 code=BookingErrorCode.EXTERNAL_REFERENCE_MISSING,
                 now=now,
             )
-        if _calendar_id(calendar) != calendar_id:
-            return _managed_confirmation_failure(
-                session,
-                conversation=conversation,
-                execution=execution,
-                booking=booking,
-                state=state,
-                code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
-                now=now,
-            )
         try:
             desired = _state_interval(state, "desired")
         except ValueError:
@@ -1671,6 +1661,16 @@ async def _finalize_managed_booking_confirmation(
                 )
             prior_calendar_interval = CalendarInterval(prior.start_at_utc, prior.end_at_utc)
             if event.interval != prior_calendar_interval:
+                return _managed_confirmation_failure(
+                    session,
+                    conversation=conversation,
+                    execution=execution,
+                    booking=booking,
+                    state=state,
+                    code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
+                    now=now,
+                )
+            if _calendar_id(calendar) != calendar_id:
                 return _managed_confirmation_failure(
                     session,
                     conversation=conversation,
@@ -1861,6 +1861,17 @@ async def _finalize_managed_booking_confirmation(
                 booking=booking,
                 state=state,
                 action_type=expected_action_type,
+                now=now,
+            )
+
+        if _calendar_id(calendar) != calendar_id:
+            return _managed_confirmation_failure(
+                session,
+                conversation=conversation,
+                execution=execution,
+                booking=booking,
+                state=state,
+                code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
                 now=now,
             )
 
