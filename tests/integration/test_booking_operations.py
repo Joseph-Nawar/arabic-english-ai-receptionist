@@ -870,6 +870,75 @@ async def test_get_booking_reports_started_confirmation_without_provider_read(
     assert calendar.get_event_calls == []
 
 
+async def test_get_booking_detects_started_confirmation_from_same_contact_conversation(
+    session_factory,
+) -> None:
+    contact_id, conversation_a_id, service_id = await _operation_context(session_factory)
+    conversation_b_id = await _conversation_for_contact(session_factory, contact_id)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    async with session_factory.begin() as session:
+        booking = await session.get(Booking, booking_id)
+        assert booking is not None
+        booking.status = BookingStatus.PENDING
+        session.add(
+            ToolExecution(
+                conversation_id=conversation_a_id,
+                tool_name="confirm_booking_action",
+                status=ToolExecutionStatus.STARTED,
+                idempotency_key=f"started-cross-conversation-{uuid.uuid4()}",
+                sanitized_arguments={},
+                sanitized_result={"booking_id": str(booking_id)},
+            )
+        )
+    calendar = _calendar_double()
+    before = await _booking_snapshot(session_factory, booking_id)
+    async with session_factory() as session:
+        result = await get_booking(
+            session,
+            calendar,
+            GetBookingRequest(conversation_id=conversation_b_id, booking_id=booking_id),
+        )
+    after = await _booking_snapshot(session_factory, booking_id)
+    assert isinstance(result, BookingReadResult)
+    assert result.data.reconciliation_status == "operation_in_progress"
+    assert calendar.get_event_calls == []
+    assert before == after
+
+
+async def test_get_booking_ignores_started_confirmation_from_different_contact(
+    session_factory,
+) -> None:
+    contact_id, owner_conversation_id, service_id = await _operation_context(session_factory)
+    _, other_conversation_id, _ = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    async with session_factory.begin() as session:
+        session.add(
+            ToolExecution(
+                conversation_id=other_conversation_id,
+                tool_name="confirm_booking_action",
+                status=ToolExecutionStatus.STARTED,
+                idempotency_key=f"started-other-contact-{uuid.uuid4()}",
+                sanitized_arguments={},
+                sanitized_result={"booking_id": str(booking_id)},
+            )
+        )
+    calendar = _calendar_double()
+    event_id = await _booking_event_id(session_factory, booking_id)
+    async with session_factory() as session:
+        result = await get_booking(
+            session,
+            calendar,
+            GetBookingRequest(conversation_id=owner_conversation_id, booking_id=booking_id),
+        )
+    assert isinstance(result, BookingReadResult)
+    assert result.data.reconciliation_status == "provider_missing"
+    assert calendar.get_event_calls == [(CALENDAR_ID, event_id)]
+
+
 async def test_get_booking_rejects_phase_one_reference_free_booking(session_factory) -> None:
     contact_id, conversation_id, service_id = await _operation_context(session_factory)
     async with session_factory.begin() as session:

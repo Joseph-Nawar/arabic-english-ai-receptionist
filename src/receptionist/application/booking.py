@@ -3058,8 +3058,10 @@ async def get_booking(
 
     started = (
         await session.scalars(
-            select(ToolExecution).where(
-                ToolExecution.conversation_id == conversation.id,
+            select(ToolExecution)
+            .join(Conversation, Conversation.id == ToolExecution.conversation_id)
+            .where(
+                Conversation.contact_id == booking.contact_id,
                 ToolExecution.tool_name == "confirm_booking_action",
                 ToolExecution.status == ToolExecutionStatus.STARTED,
             )
