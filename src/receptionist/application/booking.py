@@ -1628,8 +1628,27 @@ async def _finalize_managed_booking_confirmation(
             event.calendar_id == calendar_id
             and event.event_id == event_id
             and event.private_booking_id == str(booking.id)
-            and event.lifecycle is CalendarEventLifecycle.ACTIVE
         ):
+            return _managed_confirmation_failure(
+                session,
+                conversation=conversation,
+                execution=execution,
+                booking=booking,
+                state=state,
+                code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
+                now=now,
+            )
+        if event.lifecycle is CalendarEventLifecycle.CANCELLED:
+            if expected_action_type is PendingActionType.CANCEL_BOOKING:
+                return _managed_confirmation_success(
+                    session,
+                    conversation=conversation,
+                    execution=execution,
+                    booking=booking,
+                    state=state,
+                    action_type=expected_action_type,
+                    now=now,
+                )
             return _managed_confirmation_failure(
                 session,
                 conversation=conversation,
@@ -1666,8 +1685,19 @@ async def _finalize_managed_booking_confirmation(
                         latest.calendar_id == calendar_id
                         and latest.event_id == event_id
                         and latest.private_booking_id == str(booking.id)
-                        and latest.lifecycle is CalendarEventLifecycle.ACTIVE
                     ):
+                        return _managed_confirmation_failure(
+                            session,
+                            conversation=conversation,
+                            execution=execution,
+                            booking=booking,
+                            state=state,
+                            code=BookingErrorCode.EXTERNAL_STATE_CONFLICT,
+                            now=now,
+                        )
+                    if latest.lifecycle is CalendarEventLifecycle.CANCELLED:
+                        break
+                    if latest.lifecycle is not CalendarEventLifecycle.ACTIVE:
                         return _managed_confirmation_failure(
                             session,
                             conversation=conversation,

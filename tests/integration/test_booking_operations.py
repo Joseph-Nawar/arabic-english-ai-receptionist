@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -46,6 +47,7 @@ from receptionist.integrations.google_calendar import (
     CalendarClientError,
     CalendarErrorCode,
     CalendarEventCreate,
+    CalendarEventLifecycle,
     CalendarInterval,
 )
 from receptionist.seed import seed_reference_data
@@ -1444,6 +1446,47 @@ async def test_confirm_cancel_already_absent_event_is_reconciled_without_delete(
             action_type=PendingActionType.CANCEL_BOOKING,
             action_token=preparation.data.action_token,
             idempotency_key=f"confirm-cancel-absent-{uuid.uuid4()}",
+        ),
+        now_utc=NOW_UTC,
+    )
+
+    assert isinstance(result, ConfirmationResult)
+    assert result.data.status is BookingStatus.CANCELLED
+    assert calendar.mutation_calls == []
+
+
+async def test_confirm_cancel_matching_cancelled_event_is_reconciled_without_delete(
+    session_factory,
+) -> None:
+    contact_id, conversation_id, service_id = await _operation_context(session_factory)
+    booking_id = await _confirmed_booking(
+        session_factory, contact_id=contact_id, service_id=service_id
+    )
+    calendar = _calendar_double()
+    event_id = await _seed_calendar_event_for_booking(session_factory, calendar, booking_id)
+    event = await calendar.get_event(CALENDAR_ID, event_id)
+    assert event is not None
+    calendar._events[(CALENDAR_ID, event_id)] = replace(
+        event, lifecycle=CalendarEventLifecycle.CANCELLED
+    )
+    preparation = await prepare_cancel_booking(
+        session_factory,
+        CancelBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            idempotency_key=f"prepare-cancel-cancelled-{uuid.uuid4()}",
+        ),
+    )
+    assert isinstance(preparation, PreparationResult)
+
+    result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=PendingActionType.CANCEL_BOOKING,
+            action_token=preparation.data.action_token,
+            idempotency_key=f"confirm-cancel-cancelled-{uuid.uuid4()}",
         ),
         now_utc=NOW_UTC,
     )
