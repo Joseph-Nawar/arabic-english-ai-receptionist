@@ -68,7 +68,11 @@ def _environment() -> dict[str, str]:
 
 
 def _install_smoke_operation_fakes(
-    monkeypatch, read_statuses: tuple[str, ...], *, wrong_reschedule_interval: bool = False
+    monkeypatch,
+    read_statuses: tuple[str, ...],
+    *,
+    wrong_reschedule_interval: bool = False,
+    replay_observer=None,
 ):
     conversation_id = uuid4()
     booking_id = uuid4()
@@ -115,6 +119,8 @@ def _install_smoke_operation_fakes(
     async def fake_confirm(*args, **kwargs):
         nonlocal confirmation_calls
         confirmation_calls += 1
+        if confirmation_calls == 2 and replay_observer is not None:
+            replay_observer()
         requested_start, requested_end = (
             (start, end) if confirmation_calls <= 2 else (later_start, later_end)
         )
@@ -535,21 +541,125 @@ async def test_smoke_does_not_cleanup_when_create_never_happens(monkeypatch) -> 
     assert cleanup_called is False
 
 
-async def test_smoke_tracker_captures_identity_before_first_retrieval(monkeypatch) -> None:
-    conversation_id, now_utc = _install_smoke_operation_fakes(monkeypatch, ("provider_divergent",))
+async def test_smoke_tracker_captures_identity_before_replay_or_retrieval(monkeypatch) -> None:
     tracker = SmokeRunTracker()
 
-    with pytest.raises(SmokeWorkflowError, match="created smoke booking did not reconcile"):
-        await run_smoke_operations(
-            object(),
-            DeterministicCalendarDouble(calendar_id=SMOKE_CALENDAR_ID),
-            conversation_id=conversation_id,
-            now_utc=now_utc,
-            tracker=tracker,
-        )
+    def observe_before_replay() -> None:
+        assert tracker.result is not None
+        assert tracker.result.calendar_id == SMOKE_CALENDAR_ID
+
+    conversation_id, now_utc = _install_smoke_operation_fakes(
+        monkeypatch, ("in_sync", "in_sync", "in_sync"), replay_observer=observe_before_replay
+    )
+
+    await run_smoke_operations(
+        object(),
+        DeterministicCalendarDouble(calendar_id=SMOKE_CALENDAR_ID),
+        conversation_id=conversation_id,
+        now_utc=now_utc,
+        tracker=tracker,
+    )
 
     assert tracker.result is not None
     assert tracker.result.calendar_id == SMOKE_CALENDAR_ID
+
+
+@pytest.mark.parametrize("replay_failure", ["raises", "not_replayed"])
+async def test_smoke_cleans_event_when_replay_verification_fails(
+    monkeypatch, replay_failure: str
+) -> None:
+    configuration = build_smoke_configuration(_environment())
+    calendar = DeterministicCalendarDouble(calendar_id=SMOKE_CALENDAR_ID)
+    resources = SimpleNamespace(session_factory=object())
+    conversation_id = uuid4()
+    booking_id = uuid4()
+    event_id = "smokeeventid"
+    interval = CalendarInterval(
+        datetime(2026, 10, 11, 7, tzinfo=UTC),
+        datetime(2026, 10, 11, 8, tzinfo=UTC),
+    )
+    unrelated_event_id = "unrelatedevent"
+    confirmation_calls = 0
+
+    async def fake_prepare_create(*args, **kwargs):
+        return PreparationResult(
+            operation="prepare_create_booking",
+            data=PreparationData(
+                action_type=PendingActionType.CREATE_BOOKING,
+                action_token=str(uuid4()),
+                requested_start_at_utc=interval.start_at_utc,
+                requested_end_at_utc=interval.end_at_utc,
+            ),
+        )
+
+    async def fake_confirm(*args, **kwargs):
+        nonlocal confirmation_calls
+        confirmation_calls += 1
+        if confirmation_calls == 1:
+            await calendar.create_event(
+                SMOKE_CALENDAR_ID,
+                event_id,
+                CalendarEventCreate(interval=interval, private_booking_id=str(booking_id)),
+            )
+            return ConfirmationResult(
+                data=ConfirmationData(
+                    booking_id=booking_id,
+                    status=BookingStatus.CONFIRMED,
+                    requested_start_at_utc=interval.start_at_utc,
+                    requested_end_at_utc=interval.end_at_utc,
+                    calendar_id=SMOKE_CALENDAR_ID,
+                    calendar_event_id=event_id,
+                )
+            )
+        if replay_failure == "raises":
+            raise SmokeWorkflowError("replay provider failure")
+        return ConfirmationResult(
+            replayed=False,
+            data=ConfirmationData(
+                booking_id=booking_id,
+                status=BookingStatus.CONFIRMED,
+                requested_start_at_utc=interval.start_at_utc,
+                requested_end_at_utc=interval.end_at_utc,
+                calendar_id=SMOKE_CALENDAR_ID,
+                calendar_event_id=event_id,
+            ),
+        )
+
+    async def fake_create_conversation(*args, **kwargs) -> UUID:
+        return conversation_id
+
+    async def fake_dispose(*args, **kwargs):
+        return None
+
+    await calendar.create_event(
+        SMOKE_CALENDAR_ID,
+        unrelated_event_id,
+        CalendarEventCreate(
+            interval=CalendarInterval(
+                datetime(2026, 10, 11, 9, tzinfo=UTC),
+                datetime(2026, 10, 11, 10, tzinfo=UTC),
+            ),
+            private_booking_id="unrelated-booking",
+        ),
+    )
+    monkeypatch.setattr(
+        "scripts.calendar_smoke.create_database_resources", lambda settings: resources
+    )
+    monkeypatch.setattr(
+        "scripts.calendar_smoke.GoogleCalendarClient.from_settings", lambda settings: calendar
+    )
+    monkeypatch.setattr(
+        "scripts.calendar_smoke._create_smoke_conversation", fake_create_conversation
+    )
+    monkeypatch.setattr("scripts.calendar_smoke.prepare_create_booking", fake_prepare_create)
+    monkeypatch.setattr("scripts.calendar_smoke.confirm_booking_action", fake_confirm)
+    monkeypatch.setattr("scripts.calendar_smoke.dispose_database", fake_dispose)
+
+    with pytest.raises(SmokeWorkflowError):
+        await run_smoke(configuration)
+
+    assert await calendar.get_event(SMOKE_CALENDAR_ID, event_id) is None
+    assert await calendar.get_event(SMOKE_CALENDAR_ID, unrelated_event_id) is not None
 
 
 async def test_smoke_operations_use_existing_finite_booking_operations(monkeypatch) -> None:

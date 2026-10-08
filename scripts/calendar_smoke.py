@@ -207,12 +207,6 @@ async def run_smoke_operations(
     )
     if not isinstance(confirmed, ConfirmationResult):
         raise SmokeWorkflowError("synthetic create confirmation was rejected")
-    replay = await confirm_booking_action(
-        session_factory, calendar, create_confirmation_request, now_utc=now_utc
-    )
-    if not isinstance(replay, ConfirmationResult) or not replay.replayed:
-        raise SmokeWorkflowError("same-key confirmation replay was not observed")
-
     booking_id = confirmed.data.booking_id
     calendar_id = confirmed.data.calendar_id
     event_id = confirmed.data.calendar_event_id
@@ -225,6 +219,13 @@ async def run_smoke_operations(
     )
     if tracker is not None:
         tracker.result = smoke_result
+
+    replay = await confirm_booking_action(
+        session_factory, calendar, create_confirmation_request, now_utc=now_utc
+    )
+    if not isinstance(replay, ConfirmationResult) or not replay.replayed:
+        raise SmokeWorkflowError("same-key confirmation replay was not observed")
+
     read = await _read_booking(
         session_factory, calendar, conversation_id=conversation_id, booking_id=booking_id
     )
