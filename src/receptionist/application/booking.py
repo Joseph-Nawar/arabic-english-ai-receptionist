@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
@@ -19,7 +19,8 @@ from receptionist.domain.booking_policy import (
     decide_availability,
     intervals_overlap,
 )
-from receptionist.domain.enums import BookingStatus, PendingActionType
+from receptionist.domain.enums import BookingStatus, PendingActionStatus, PendingActionType
+from receptionist.domain.state import PendingActionState
 from receptionist.integrations.google_calendar import (
     CalendarClient,
     CalendarClientError,
@@ -65,6 +66,25 @@ def _require_non_blank(value: str) -> str:
     if not value.strip():
         raise ValueError("value must not be blank")
     return value
+
+
+def generate_action_token() -> str:
+    """Return a fresh opaque token for one prepared booking action."""
+    return str(uuid4())
+
+
+def pending_action_matches(
+    current: PendingActionState | None,
+    expected_type: PendingActionType,
+    action_token: str,
+) -> bool:
+    """Require the exact current awaiting action type and token."""
+    return (
+        current is not None
+        and current.status is PendingActionStatus.AWAITING_CONFIRMATION
+        and current.type is expected_type
+        and current.payload.get("action_token") == action_token
+    )
 
 
 def _validate_safe_mapping(values: Mapping[str, SafeScalar]) -> dict[str, SafeScalar]:

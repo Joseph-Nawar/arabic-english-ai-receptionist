@@ -18,11 +18,15 @@ from receptionist.application.booking import (
     GetBookingRequest,
     PreparationData,
     PreparationResult,
+    generate_action_token,
+    pending_action_matches,
     RescheduleBookingRequest,
     ServiceAreaLookupRequest,
     ServiceLookupRequest,
 )
 from receptionist.domain.enums import BookingStatus, PendingActionType
+from receptionist.domain.state import PendingActionState
+from receptionist.domain.enums import PendingActionStatus
 
 pytestmark = pytest.mark.unit
 
@@ -136,6 +140,30 @@ def test_exact_confirmation_requires_action_token_and_own_idempotency_key() -> N
     )
     assert confirmation.action_token == ACTION_MARKER
     assert confirmation.idempotency_key == "confirmation-key"
+
+
+def test_action_tokens_are_fresh_uuid_based_and_pending_identity_is_exact() -> None:
+    first = generate_action_token()
+    second = generate_action_token()
+
+    assert UUID(first)
+    assert UUID(second)
+    assert first != second
+    assert "@" not in first
+    assert "phone" not in first.casefold()
+    assert "email" not in first.casefold()
+
+    current = PendingActionState(
+        type=PendingActionType.RESCHEDULE_BOOKING,
+        status=PendingActionStatus.AWAITING_CONFIRMATION,
+        payload={"action_token": first},
+        created_at=NOW,
+        confirmed_at=None,
+    )
+    assert pending_action_matches(current, PendingActionType.RESCHEDULE_BOOKING, first)
+    assert not pending_action_matches(current, PendingActionType.RESCHEDULE_BOOKING, second)
+    assert not pending_action_matches(current, PendingActionType.CANCEL_BOOKING, first)
+    assert not pending_action_matches(None, PendingActionType.RESCHEDULE_BOOKING, first)
 
 
 @pytest.mark.parametrize(
