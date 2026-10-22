@@ -334,6 +334,96 @@ async def test_booking_time_pair_and_order_constraints(session_factory) -> None:
         )
 
 
+async def test_booking_calendar_reference_constraints_preserve_phase_one_rows(
+    session_factory,
+) -> None:
+    contact_id, service_id, _ = await _create_contact_conversation_service(session_factory)
+
+    async with session_factory.begin() as session:
+        session.add_all(
+            [
+                Booking(
+                    contact_id=contact_id,
+                    service_id=service_id,
+                    status=BookingStatus.PENDING,
+                    booking_data={},
+                ),
+                Booking(
+                    contact_id=contact_id,
+                    service_id=service_id,
+                    status=BookingStatus.PENDING,
+                    booking_data={},
+                ),
+            ]
+        )
+
+    async with session_factory() as session:
+        session.add(
+            Booking(
+                contact_id=contact_id,
+                service_id=service_id,
+                status=BookingStatus.PENDING,
+                calendar_id="calendar-only",
+                booking_data={},
+            )
+        )
+        with pytest.raises(IntegrityError):
+            await session.flush()
+        await session.rollback()
+
+    async with session_factory() as session:
+        session.add(
+            Booking(
+                contact_id=contact_id,
+                service_id=service_id,
+                status=BookingStatus.CONFIRMED,
+                booking_data={},
+            )
+        )
+        with pytest.raises(IntegrityError):
+            await session.flush()
+        await session.rollback()
+
+    async with session_factory.begin() as session:
+        session.add(
+            Booking(
+                contact_id=contact_id,
+                service_id=service_id,
+                status=BookingStatus.PENDING,
+                calendar_id="calendar-a",
+                calendar_event_id="event-a",
+                booking_data={},
+            )
+        )
+
+    async with session_factory() as session:
+        session.add(
+            Booking(
+                contact_id=contact_id,
+                service_id=service_id,
+                status=BookingStatus.PENDING,
+                calendar_id="calendar-a",
+                calendar_event_id="event-a",
+                booking_data={},
+            )
+        )
+        with pytest.raises(IntegrityError):
+            await session.flush()
+        await session.rollback()
+
+    async with session_factory.begin() as session:
+        session.add(
+            Booking(
+                contact_id=contact_id,
+                service_id=service_id,
+                status=BookingStatus.CANCELLED,
+                calendar_id="calendar-b",
+                calendar_event_id="event-b",
+                booking_data={},
+            )
+        )
+
+
 async def test_handoff_active_partial_uniqueness_allows_history(session_factory) -> None:
     _, _, conversation_id = await _create_contact_conversation_service(session_factory)
 

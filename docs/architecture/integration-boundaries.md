@@ -1,6 +1,6 @@
 # Integration boundaries
 
-This document is conceptual in Phase 0. It defines future responsibilities and ownership; it does not authorize matching Python interfaces, classes, packages, or provider SDKs before their phase needs a real implementation.
+This document records the implemented Phase 2 Calendar boundary and the future ownership boundaries. The project remains a modular monolith with one concrete external integration: one configured writable Google Calendar.
 
 ## Boundary rules
 
@@ -13,19 +13,22 @@ This document is conceptual in Phase 0. It defines future responsibilities and o
 - Business decisions remain in application/domain code once those later phases exist.
 - Web routes and future UI actions must not embed provider-specific logic.
 
+The Phase 2 Google client uses out-of-band authorized-user refresh-token provisioning with exactly `https://www.googleapis.com/auth/calendar.events` and `https://www.googleapis.com/auth/calendar.freebusy`. The application has no OAuth consent UI and does not persist credential files. Provider calls are bounded and translated to small application-owned snapshots/errors; raw Google dictionaries, HTTP bodies, headers, and ETags do not cross the boundary.
+
 ## Authority model
 
-- Google Calendar or the selected booking provider is authoritative for actual live appointment availability and external calendar event state; it does not decide business policy.
+- Google Calendar is authoritative for actual live appointment availability and external booking-event existence/state; it does not decide business policy.
 - HubSpot CRM is authoritative for CRM customer, lead, and opportunity lifecycle state; it does not decide appointment availability.
-- PostgreSQL is authoritative for local identity mapping, conversations, handoff state, tool and audit records, idempotency records, and local workflow state.
-- The LLM is authoritative for none of these concerns. It may perform language understanding, bounded tool selection, and response generation, but it cannot bypass application authorization or validation.
-- Application-level idempotency protects side effects. Provider adapters, when a real integration exists, later translate that protection into provider-specific idempotency and retry semantics.
+- PostgreSQL is authoritative for local identity mapping, conversations, pending actions, ToolExecution claims/replays, audit records, idempotency records, local Booking workflow state, and reconciliation state.
+- Business configuration and application policy are authoritative for service rules, hours, areas, booking policy, and whether a new operation is permitted.
+- The LLM is authoritative for none of these factual or side-effect decisions. It may perform language understanding, bounded tool selection, and response generation, but it cannot bypass application authorization or validation.
+- Application-level idempotency protects side effects. The Calendar boundary uses deterministic client-generated event IDs, a private opaque Booking marker, persisted Calendar identity, and transient ETag conditional patch/delete operations to reconcile external state after ambiguous writes.
 
 ## Future responsibilities
 
 ### Calendar
 
-Own provider authentication, availability reads, event creation/update/cancellation, timezone translation, provider-specific idempotency, and provider error mapping. The provider owns actual live availability and external event state. The application owns booking policy, validation, confirmation state, local workflow state, and the durable local booking record.
+Own provider authentication, availability reads, event creation/update/cancellation, timezone translation, provider-specific error mapping, and the concrete Google Calendar request translation. Google Calendar owns actual live availability and external event state. The application owns booking policy, validation, confirmation state, local workflow state, deterministic event identity, and the durable local Booking record. V1 has one Calendar/capacity pool, no technician/resource assignment, and no atomic free/busy-plus-insert transaction.
 
 ### CRM
 

@@ -259,6 +259,8 @@ class Booking(Base):
     )
     start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    calendar_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    calendar_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     booking_data: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -275,7 +277,18 @@ class Booking(Base):
             "(start_at IS NULL AND end_at IS NULL) OR start_at < end_at",
             name="ck_booking_time_order",
         ),
+        CheckConstraint(
+            "(calendar_id IS NULL AND calendar_event_id IS NULL) OR "
+            "(calendar_id IS NOT NULL AND calendar_event_id IS NOT NULL)",
+            name="ck_booking_calendar_reference_pair",
+        ),
+        CheckConstraint(
+            "status <> 'confirmed' OR "
+            "(status = 'confirmed' AND calendar_id IS NOT NULL AND calendar_event_id IS NOT NULL)",
+            name="ck_booking_confirmed_calendar_reference",
+        ),
         Index("ix_booking_contact_status", "contact_id", "status"),
+        Index("uq_booking_calendar_event", "calendar_id", "calendar_event_id", unique=True),
     )
 
 
