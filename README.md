@@ -1,6 +1,6 @@
 # Arabic-English AI Receptionist
 
-Phase 2 implementation candidate — pending independent review and human approval.
+Phase 2 is complete following independent technical review, remediation, and repository-owner approval.
 
 Phase 1 was completed after independent review and remediation for a production-style portfolio project. The current implementation is a deliberately small FastAPI modular monolith with:
 
@@ -16,4 +16,4 @@ Google Calendar is authoritative for live availability and external event state.
 
 Start with [the local setup guide](docs/development/setup.md), read [the canonical roadmap](docs/roadmap.md), and review [the architecture](docs/architecture/system-overview.md). Phase 2 uses one configured writable Calendar and out-of-band OAuth authorized-user refresh-token provisioning; it has no application consent UI and no credentials in the repository. The separate guarded `make calendar-smoke` command is manual only and never runs in CI.
 
-Phase 3 HubSpot, messaging, voice, LLM orchestration, n8n, workers, outbox processing, dashboard/UI, Redis, multitenancy, and other later-phase behavior remain not started. This implementation candidate does not imply production readiness or phase completion.
+The dedicated live Google Calendar smoke was not executed because dedicated Calendar credentials were unavailable. Phase 3 HubSpot, messaging, voice, LLM orchestration, n8n, workers, outbox processing, dashboard/UI, Redis, multitenancy, and other later-phase behavior remain not started. Phase 2 completion does not imply production readiness.
