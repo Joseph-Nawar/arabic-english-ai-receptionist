@@ -78,6 +78,20 @@ def test_provider_national_phone_is_normalized_with_business_region() -> None:
     assert result.outcome is CRMContactIdentityOutcome.MATCHED
 
 
+def test_matching_primary_phone_allows_distinct_secondary_mobile() -> None:
+    result = decide(phone_search=search(contact(phone=PHONE, mobilephone="+966551234567")))
+
+    assert result.outcome is CRMContactIdentityOutcome.MATCHED
+    assert result.hubspot_contact_id == "101"
+
+
+def test_matching_mobile_allows_distinct_secondary_primary_phone() -> None:
+    result = decide(phone_search=search(contact(phone="+966551234567", mobilephone=PHONE)))
+
+    assert result.outcome is CRMContactIdentityOutcome.MATCHED
+    assert result.hubspot_contact_id == "101"
+
+
 def test_nonmatching_phone_is_not_found() -> None:
     result = decide(phone_search=search(contact(phone="+966551234567")))
 
@@ -258,6 +272,20 @@ def test_email_match_with_conflicting_nonblank_provider_phone_is_conflict() -> N
     result = decide(
         email=EMAIL,
         email_match=contact(email=EMAIL, phone="+966551234567"),
+        phone_search=search(),
+    )
+
+    assert result.outcome is CRMContactIdentityOutcome.IDENTITY_CONFLICT
+
+
+def test_email_match_conflicts_when_all_known_provider_phones_differ() -> None:
+    result = decide(
+        email=EMAIL,
+        email_match=contact(
+            email=EMAIL,
+            phone="+966551234567",
+            mobilephone="+966561234567",
+        ),
         phone_search=search(),
     )
 

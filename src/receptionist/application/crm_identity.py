@@ -130,9 +130,8 @@ def decide_crm_contact_identity(
             if candidate.archived:
                 malformed_matching_data = True
                 continue
-            if phone is not None and any(
-                value is not None and value != phone for value in provider_phones
-            ):
+            known_provider_phones = tuple(value for value in provider_phones if value is not None)
+            if phone is not None and known_provider_phones and phone not in known_provider_phones:
                 conflicts.add(contact_id)
             if email is not None and provider_email is not None and provider_email != email:
                 conflicts.add(contact_id)
