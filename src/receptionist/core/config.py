@@ -32,6 +32,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_ignore_empty=True,
         extra="forbid",
+        hide_input_in_errors=True,
     )
 
     @field_validator("database_url")
@@ -95,7 +96,7 @@ class Settings(BaseSettings):
 
     @property
     def hubspot_configured(self) -> bool:
-        """Return whether the key and expected account identifier are both present."""
+        """Return whether key/account settings are structurally present, not authorized."""
         return bool(
             self.hubspot_service_key is not None
             and self.hubspot_service_key.get_secret_value().strip()

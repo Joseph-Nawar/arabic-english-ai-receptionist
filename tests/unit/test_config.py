@@ -49,9 +49,6 @@ def test_google_calendar_settings_are_optional_for_provider_free_runs() -> None:
     assert settings.google_calendar_request_timeout_seconds == 10.0
     assert settings.google_calendar_configured is False
     assert settings.safe_summary()["google_calendar_configured"] is False
-    assert settings.hubspot_service_key is None
-    assert settings.hubspot_portal_id is None
-    assert settings.hubspot_configured is False
 
 
 @pytest.mark.parametrize(
@@ -119,140 +116,6 @@ def test_google_calendar_secrets_are_absent_from_repr_and_logs(
     assert TEST_REFRESH_TOKEN.get_secret_value() not in caplog.text
     assert "google_oauth" not in caplog.text
     assert "google_calendar_id" not in caplog.text
-
-
-def test_hubspot_settings_are_optional_and_safe_when_unconfigured() -> None:
-    settings = Settings(
-        _env_file=None,
-        app_env="test",
-        log_level="INFO",
-        database_url=TEST_DATABASE_URL,
-    )
-
-    assert settings.hubspot_service_key is None
-    assert settings.hubspot_portal_id is None
-    assert settings.hubspot_request_timeout_seconds == 10.0
-    assert settings.hubspot_configured is False
-    assert settings.safe_summary()["hubspot_configured"] is False
-
-
-def test_hubspot_configuration_requires_both_key_and_portal_id() -> None:
-    base = {
-        "_env_file": None,
-        "app_env": "test",
-        "log_level": "INFO",
-        "database_url": TEST_DATABASE_URL,
-    }
-    incomplete_configurations = (
-        {"hubspot_service_key": "key-placeholder"},
-        {"hubspot_portal_id": "123456"},
-    )
-
-    for incomplete in incomplete_configurations:
-        settings = Settings(**base, **incomplete)
-        assert settings.hubspot_configured is False
-
-
-def test_hubspot_configuration_is_structural_and_available_in_test_environment() -> None:
-    settings = Settings(
-        _env_file=None,
-        app_env="test",
-        log_level="INFO",
-        database_url=TEST_DATABASE_URL,
-        hubspot_service_key="unit-test-key-placeholder",
-        hubspot_portal_id="123456",
-    )
-
-    assert settings.hubspot_configured is True
-    assert settings.app_env == "test"
-
-
-@pytest.mark.parametrize("portal_id", ["", "   ", "abc", "0", "-1", "123.4"])
-def test_hubspot_portal_id_must_be_a_positive_decimal_identifier(portal_id: str) -> None:
-    with pytest.raises(ValidationError, match="hubspot_portal_id"):
-        Settings(
-            _env_file=None,
-            app_env="test",
-            log_level="INFO",
-            database_url=TEST_DATABASE_URL,
-            hubspot_portal_id=portal_id,
-        )
-
-
-@pytest.mark.parametrize(
-    ("timeout", "error_type"),
-    [(0, "greater_than"), (-1, "greater_than"), (30.1, "less_than_equal")],
-)
-def test_hubspot_timeout_is_positive_and_bounded(timeout: float, error_type: str) -> None:
-    with pytest.raises(ValidationError) as exc_info:
-        Settings(
-            _env_file=None,
-            app_env="test",
-            log_level="INFO",
-            database_url=TEST_DATABASE_URL,
-            hubspot_request_timeout_seconds=timeout,
-        )
-    assert any(error["type"] == error_type for error in exc_info.value.errors())
-
-
-def test_hubspot_service_key_is_redacted_from_repr_and_logs(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    service_key_sentinel = "hubspot-secret-sentinel"
-    settings = Settings(
-        _env_file=None,
-        app_env="test",
-        log_level="INFO",
-        database_url=TEST_DATABASE_URL,
-        hubspot_service_key=service_key_sentinel,
-        hubspot_portal_id="123456",
-    )
-    configure_logging(settings.log_level)
-
-    with caplog.at_level(logging.INFO):
-        log_configuration(settings)
-
-    assert service_key_sentinel not in repr(settings)
-    assert service_key_sentinel not in caplog.text
-    assert service_key_sentinel not in settings.model_dump_json()
-    assert "hubspot_service_key" not in repr(settings)
-    assert "hubspot_service_key" not in caplog.text
-
-
-def test_hubspot_safe_summary_excludes_key_and_portal_id() -> None:
-    service_key_sentinel = "hubspot-summary-sentinel"
-    settings = Settings(
-        _env_file=None,
-        app_env="test",
-        log_level="INFO",
-        database_url=TEST_DATABASE_URL,
-        hubspot_service_key=service_key_sentinel,
-        hubspot_portal_id="987654",
-        hubspot_request_timeout_seconds=4.5,
-    )
-
-    summary = settings.safe_summary()
-    assert summary["hubspot_configured"] is True
-    assert summary["hubspot_request_timeout_seconds"] == 4.5
-    assert service_key_sentinel not in repr(summary)
-    assert "987654" not in repr(summary)
-
-
-@pytest.mark.parametrize("app_env", ["test", "ci"])
-def test_test_and_ci_settings_with_credentials_remain_non_production(
-    app_env: str,
-) -> None:
-    settings = Settings(
-        _env_file=None,
-        app_env=app_env,
-        log_level="INFO",
-        database_url=TEST_DATABASE_URL,
-        hubspot_service_key="must-not-enable-live-test-traffic",
-        hubspot_portal_id="123456",
-    )
-
-    assert settings.hubspot_configured is True
-    assert settings.app_env in {"test", "ci"}
 
 
 def test_settings_tests_ignore_dotenv_and_ambient_google_configuration(
@@ -415,3 +278,151 @@ def test_google_secret_values_are_absent_from_safe_summary_and_settings_errors()
     assert TEST_CLIENT_SECRET.get_secret_value() not in str(safe_summary)
     assert TEST_REFRESH_TOKEN.get_secret_value() not in str(safe_summary)
     assert "calendar-id" not in str(safe_summary)
+
+
+def test_hubspot_settings_are_optional_and_safe_when_unconfigured() -> None:
+    settings = Settings(
+        _env_file=None,
+        app_env="test",
+        log_level="INFO",
+        database_url=TEST_DATABASE_URL,
+    )
+
+    assert settings.hubspot_service_key is None
+    assert settings.hubspot_portal_id is None
+    assert settings.hubspot_request_timeout_seconds == 10.0
+    assert settings.hubspot_configured is False
+    assert settings.safe_summary()["hubspot_configured"] is False
+
+
+def test_hubspot_configuration_requires_both_key_and_portal_id() -> None:
+    base = {
+        "_env_file": None,
+        "app_env": "test",
+        "log_level": "INFO",
+        "database_url": TEST_DATABASE_URL,
+    }
+    incomplete_configurations = (
+        {"hubspot_service_key": TEST_CLIENT_SECRET},
+        {"hubspot_portal_id": "123456"},
+    )
+
+    for incomplete in incomplete_configurations:
+        settings = Settings(**base, **incomplete)
+        assert settings.hubspot_configured is False
+
+
+def test_hubspot_configuration_is_structural_and_available_in_test_environment() -> None:
+    settings = Settings(
+        _env_file=None,
+        app_env="test",
+        log_level="INFO",
+        database_url=TEST_DATABASE_URL,
+        hubspot_service_key=TEST_CLIENT_SECRET,
+        hubspot_portal_id="123456",
+    )
+
+    assert settings.hubspot_configured is True
+    assert settings.app_env == "test"
+
+
+@pytest.mark.parametrize("portal_id", ["", "   ", "abc", "0", "-1", "123.4"])
+def test_hubspot_portal_id_must_be_a_positive_decimal_identifier(portal_id: str) -> None:
+    with pytest.raises(ValidationError, match="hubspot_portal_id"):
+        Settings(
+            _env_file=None,
+            app_env="test",
+            log_level="INFO",
+            database_url=TEST_DATABASE_URL,
+            hubspot_portal_id=portal_id,
+        )
+
+
+@pytest.mark.parametrize(
+    ("timeout", "error_type"),
+    [(0, "greater_than"), (-1, "greater_than"), (30.1, "less_than_equal")],
+)
+def test_hubspot_timeout_is_positive_and_bounded(timeout: float, error_type: str) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            _env_file=None,
+            app_env="test",
+            log_level="INFO",
+            database_url=TEST_DATABASE_URL,
+            hubspot_request_timeout_seconds=timeout,
+        )
+    assert any(error["type"] == error_type for error in exc_info.value.errors())
+
+
+def test_hubspot_service_key_is_redacted_from_repr_and_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    credential_sentinel = "fixture-credential-marker-a"
+    settings = Settings(
+        _env_file=None,
+        app_env="test",
+        log_level="INFO",
+        database_url=TEST_DATABASE_URL,
+        hubspot_service_key=credential_sentinel,
+        hubspot_portal_id="123456",
+    )
+    configure_logging(settings.log_level)
+
+    with caplog.at_level(logging.INFO):
+        log_configuration(settings)
+
+    assert credential_sentinel not in repr(settings)
+    assert credential_sentinel not in caplog.text
+    assert credential_sentinel not in settings.model_dump_json()
+    assert "hubspot_service_key" not in repr(settings)
+    assert "hubspot_service_key" not in caplog.text
+
+
+def test_hubspot_safe_summary_excludes_key_and_portal_id() -> None:
+    credential_sentinel = "fixture-credential-marker-b"
+    settings = Settings(
+        _env_file=None,
+        app_env="test",
+        log_level="INFO",
+        database_url=TEST_DATABASE_URL,
+        hubspot_service_key=credential_sentinel,
+        hubspot_portal_id="987654",
+        hubspot_request_timeout_seconds=4.5,
+    )
+
+    summary = settings.safe_summary()
+    assert summary["hubspot_configured"] is True
+    assert summary["hubspot_request_timeout_seconds"] == 4.5
+    assert credential_sentinel not in repr(summary)
+    assert "987654" not in repr(summary)
+
+
+def test_invalid_hubspot_service_key_is_not_repeated_in_validation_errors() -> None:
+    credential_marker = "fixture-error-marker"
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            _env_file=None,
+            app_env="test",
+            log_level="INFO",
+            database_url=TEST_DATABASE_URL,
+            hubspot_service_key={"fixture": credential_marker},  # type: ignore[arg-type]
+        )
+
+    assert credential_marker not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("app_env", ["test", "ci"])
+def test_test_and_ci_settings_with_credentials_remain_non_production(
+    app_env: str,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        app_env=app_env,
+        log_level="INFO",
+        database_url=TEST_DATABASE_URL,
+        hubspot_service_key=TEST_CLIENT_SECRET,
+        hubspot_portal_id="123456",
+    )
+
+    assert settings.hubspot_configured is True
+    assert settings.app_env in {"test", "ci"}
