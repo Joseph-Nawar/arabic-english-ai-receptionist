@@ -8,9 +8,12 @@ import pytest
 
 from receptionist.core.config import Settings
 from receptionist.integrations.hubspot import (
+    HubSpotCapabilityStatus,
     HubSpotClient,
     HubSpotErrorCode,
+    HubSpotPreflightOutcome,
     HubSpotProviderError,
+    preflight_hubspot,
 )
 
 TEST_DATABASE_URL = "postgresql+psycopg://receptionist@localhost/receptionist_test"
@@ -700,3 +703,253 @@ async def test_association_write_with_unusable_readback_is_uncertain_without_sec
     assert response_body_sentinel not in repr(error)
     assert AUTH_VALUE not in repr(error)
     assert sum(request.method == "PUT" for request in requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_account_preflight_verifies_identity_but_not_write_capabilities() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return json_response({"portalId": 123456})
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        result = await client.preflight_account()
+
+    assert result.outcome is HubSpotPreflightOutcome.VERIFIED
+    assert result.account_identity_verified is True
+    assert result.capability_status is HubSpotCapabilityStatus.UNVERIFIED
+    assert result.writes_enabled is False
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+    assert requests[0].url == "https://api.hubapi.com/account-info/2026-03/details"
+    assert requests[0].headers["Authorization"] == f"Bearer {AUTH_VALUE}"
+    assert AUTH_VALUE not in requests[0].url.query.decode()
+
+
+@pytest.mark.asyncio
+async def test_account_preflight_rejects_portal_mismatch() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return json_response({"portalId": 777777})
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        result = await client.preflight_account()
+
+    assert result.outcome is HubSpotPreflightOutcome.ACCOUNT_MISMATCH
+    assert result.account_identity_verified is False
+    assert result.writes_enabled is False
+
+
+@pytest.mark.parametrize(
+    "partial_settings",
+    [
+        {"hubspot_portal_id": "123456"},
+        {"hubspot_service_key": AUTH_VALUE},
+    ],
+    ids=["missing-service-key", "missing-portal-id"],
+)
+@pytest.mark.asyncio
+async def test_account_preflight_returns_not_configured_without_http(
+    partial_settings: dict[str, str],
+) -> None:
+    values: dict[str, object] = {
+        "_env_file": None,
+        "app_env": "test",
+        "log_level": "INFO",
+        "database_url": TEST_DATABASE_URL,
+        **partial_settings,
+    }
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return json_response({"portalId": 123456})
+
+    result = await preflight_hubspot(Settings(**values), transport=httpx.MockTransport(handler))
+
+    assert result.outcome is HubSpotPreflightOutcome.NOT_CONFIGURED
+    assert result.account_identity_verified is False
+    assert result.writes_enabled is False
+    assert requests == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"portalId": "123456"},
+        {"portalId": ""},
+        {"portalId": 0},
+        {"portalId": True},
+    ],
+)
+@pytest.mark.asyncio
+async def test_account_preflight_rejects_malformed_portal_id(
+    payload: dict[str, object],
+) -> None:
+    provider_sentinel = "provider-account-secret-sentinel"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return json_response({**payload, "private": provider_sentinel})
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        result = await client.preflight_account()
+
+    assert result.outcome is HubSpotPreflightOutcome.INVALID_RESPONSE
+    assert result.account_identity_verified is False
+    assert provider_sentinel not in repr(result)
+    assert AUTH_VALUE not in repr(result)
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome"),
+    [
+        (401, HubSpotPreflightOutcome.PERMISSION_DENIED),
+        (403, HubSpotPreflightOutcome.PERMISSION_DENIED),
+        (404, HubSpotPreflightOutcome.VERIFICATION_UNAVAILABLE),
+        (429, HubSpotPreflightOutcome.PROVIDER_UNAVAILABLE),
+        (503, HubSpotPreflightOutcome.PROVIDER_UNAVAILABLE),
+    ],
+)
+@pytest.mark.asyncio
+async def test_account_preflight_maps_safe_provider_failures(
+    status: int, outcome: HubSpotPreflightOutcome
+) -> None:
+    provider_sentinel = "private-account-provider-response"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"message": provider_sentinel})
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        result = await client.preflight_account()
+
+    assert result.outcome is outcome
+    assert result.account_identity_verified is False
+    assert result.writes_enabled is False
+    assert provider_sentinel not in str(result)
+    assert provider_sentinel not in repr(result)
+    assert AUTH_VALUE not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_account_preflight_timeout_is_provider_unavailable() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("private account response timeout", request=request)
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        result = await client.preflight_account()
+
+    assert result.outcome is HubSpotPreflightOutcome.PROVIDER_UNAVAILABLE
+    assert result.writes_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("body", "response_sentinel"),
+    [
+        (b"not-json", ""),
+        (b"[]", ""),
+        (b"", ""),
+        (b'{"private":"raw-account-response-sentinel"}', "raw-account-response-sentinel"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_account_preflight_rejects_unusable_success_response(
+    body: bytes, response_sentinel: str
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        result = await client.preflight_account()
+
+    assert result.outcome is HubSpotPreflightOutcome.INVALID_RESPONSE
+    assert result.account_identity_verified is False
+    if response_sentinel:
+        assert response_sentinel not in repr(result)
+    assert AUTH_VALUE not in repr(result)
+
+
+@pytest.mark.parametrize("changed_setting", ["hubspot_service_key", "hubspot_portal_id"])
+@pytest.mark.asyncio
+async def test_configuration_change_invalidates_account_preflight(
+    changed_setting: str,
+) -> None:
+    from pydantic import SecretStr
+
+    configured = settings()
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return json_response({"portalId": 123456})
+
+    async with HubSpotClient(configured, transport=httpx.MockTransport(handler)) as client:
+        verified = await client.preflight_account()
+        assert verified.outcome is HubSpotPreflightOutcome.VERIFIED
+
+        if changed_setting == "hubspot_service_key":
+            configured.hubspot_service_key = SecretStr("rotated-key")
+        else:
+            configured.hubspot_portal_id = "654321"
+        invalidated = await client.preflight_account()
+
+    assert invalidated.outcome is HubSpotPreflightOutcome.VERIFICATION_UNAVAILABLE
+    assert invalidated.account_identity_verified is False
+    assert invalidated.writes_enabled is False
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_mocked_account_match_never_enables_production_writes() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return json_response({"portalId": 123456})
+
+    verification_settings = settings(app_env="production")
+    operational_settings = settings(app_env="production")
+    async with HubSpotClient(
+        verification_settings, transport=httpx.MockTransport(handler)
+    ) as verifier:
+        result = await verifier.preflight_account()
+    assert result.outcome is HubSpotPreflightOutcome.VERIFIED
+    assert result.writes_enabled is False
+
+    async with HubSpotClient(
+        operational_settings, transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises(HubSpotProviderError) as exc_info:
+            await client.create_contact(email="customer@example.com")
+
+    assert exc_info.value.code is HubSpotErrorCode.ACTIVATION_REQUIRED
+    assert [request.method for request in requests] == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_failed_preflight_blocks_contact_note_and_association_writes() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return json_response({"portalId": 777777})
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        result = await client.preflight_account()
+        assert result.outcome is HubSpotPreflightOutcome.ACCOUNT_MISMATCH
+        for write in (
+            lambda: client.create_contact(email="customer@example.com"),
+            lambda: client.update_contact("987654", email="customer@example.com"),
+            lambda: client.create_note(
+                "654321",
+                body="Booking confirmed. source-op:abc123",
+                timestamp=datetime(2026, 10, 25, 10, 30, tzinfo=UTC),
+            ),
+            lambda: client.ensure_note_contact_association("654321", "987654"),
+        ):
+            with pytest.raises(HubSpotProviderError) as exc_info:
+                await write()
+            assert exc_info.value.code is HubSpotErrorCode.ACTIVATION_REQUIRED
+
+    assert len(requests) == 1
+    assert requests[0].method == "GET"

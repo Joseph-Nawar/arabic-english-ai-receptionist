@@ -1,8 +1,8 @@
-"""Bounded HTTP access to HubSpot Contacts and Notes.
+"""Bounded HTTP access to HubSpot Contacts, Notes, and account identity.
 
 Routes in this module follow HubSpot's documented CRM ``2026-09`` object and
-search APIs. Account identity preflight and application operations belong to
-later, separate layers; this client does not persist application state.
+search APIs. Account identity uses the documented Account Info ``2026-03``
+route. This client does not persist application state or authorize CRM writes.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ class HubSpotErrorCode(StrEnum):
 
     NOT_CONFIGURED = "not_configured"
     LIVE_TRANSPORT_DISABLED = "live_transport_disabled"
+    ACTIVATION_REQUIRED = "activation_required"
     INVALID_REQUEST = "invalid_request"
     VALIDATION = "validation"
     UNAUTHORIZED = "unauthorized"
@@ -49,6 +50,50 @@ class HubSpotErrorCode(StrEnum):
     TIMEOUT = "timeout"
     RESPONSE_TOO_LARGE = "response_too_large"
     INVALID_RESPONSE = "invalid_response"
+
+
+class HubSpotPreflightOutcome(StrEnum):
+    """Safe outcome of the Service Key account-identity check."""
+
+    VERIFIED = "verified"
+    NOT_CONFIGURED = "not_configured"
+    ACCOUNT_MISMATCH = "account_mismatch"
+    PERMISSION_DENIED = "permission_denied"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    INVALID_RESPONSE = "invalid_response"
+    VERIFICATION_UNAVAILABLE = "verification_unavailable"
+
+
+class HubSpotCapabilityStatus(StrEnum):
+    """Whether the key's required CRM permissions have been established."""
+
+    UNVERIFIED = "unverified"
+    VERIFIED = "verified"
+
+
+@dataclass(frozen=True, slots=True)
+class HubSpotPreflightResult:
+    """Safe account-binding result, separate from CRM capability activation."""
+
+    outcome: HubSpotPreflightOutcome
+    account_identity_verified: bool
+    capability_status: HubSpotCapabilityStatus
+
+    @property
+    def writes_enabled(self) -> bool:
+        """Writes require verified identity and permissions; permissions remain unknown."""
+        return (
+            self.outcome is HubSpotPreflightOutcome.VERIFIED
+            and self.account_identity_verified
+            and self.capability_status is HubSpotCapabilityStatus.VERIFIED
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HubSpotAccountSnapshot:
+    """Minimum account detail needed to bind a Service Key to a portal."""
+
+    portal_id: str
 
 
 class HubSpotProviderError(Exception):
@@ -120,11 +165,17 @@ class HubSpotClient:
     ) -> None:
         if not settings.hubspot_configured or settings.hubspot_service_key is None:
             raise HubSpotProviderError(HubSpotErrorCode.NOT_CONFIGURED)
+        if not _valid_portal_id(settings.hubspot_portal_id):
+            raise HubSpotProviderError(HubSpotErrorCode.NOT_CONFIGURED)
         if settings.app_env in {"test", "ci"} and not isinstance(transport, httpx.MockTransport):
             raise HubSpotProviderError(HubSpotErrorCode.LIVE_TRANSPORT_DISABLED)
 
+        self._settings = settings
         self._service_key = settings.hubspot_service_key
+        self._expected_portal_id = settings.hubspot_portal_id
         self._timeout_seconds = settings.hubspot_request_timeout_seconds
+        self._mock_transport = isinstance(transport, httpx.MockTransport)
+        self._preflight_result: HubSpotPreflightResult | None = None
         self._client = httpx.AsyncClient(
             base_url=API_ORIGIN,
             timeout=httpx.Timeout(self._timeout_seconds),
@@ -140,6 +191,36 @@ class HubSpotClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def get_account_details(self) -> HubSpotAccountSnapshot:
+        """Read the account portal ID via the documented 2026-03 Account Info route."""
+        payload = await self._request_json("GET", "/account-info/2026-03/details")
+        portal_id = payload.get("portalId")
+        if not isinstance(portal_id, int) or isinstance(portal_id, bool) or portal_id <= 0:
+            raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
+        return HubSpotAccountSnapshot(portal_id=str(portal_id))
+
+    async def preflight_account(self) -> HubSpotPreflightResult:
+        """Verify account identity on this client without activating write capability."""
+        if not self._configuration_is_current():
+            result = _preflight_result(HubSpotPreflightOutcome.VERIFICATION_UNAVAILABLE)
+            self._preflight_result = result
+            return result
+
+        try:
+            account = await self.get_account_details()
+        except HubSpotProviderError as error:
+            result = _preflight_error_result(error)
+        else:
+            if account.portal_id == self._expected_portal_id:
+                result = _preflight_result(
+                    HubSpotPreflightOutcome.VERIFIED,
+                    account_identity_verified=True,
+                )
+            else:
+                result = _preflight_result(HubSpotPreflightOutcome.ACCOUNT_MISMATCH)
+        self._preflight_result = result
+        return result
 
     async def get_contact_by_id(self, contact_id: str) -> HubSpotContactSnapshot:
         record_id = _record_id(contact_id)
@@ -207,6 +288,7 @@ class HubSpotClient:
     async def create_contact(
         self, *, email: str, phone: str | None = None
     ) -> HubSpotContactSnapshot:
+        self._assert_write_activation()
         properties: dict[str, str] = {"email": _nonblank_text(email, max_length=254)}
         if phone is not None:
             properties["phone"] = _nonblank_text(phone, max_length=64)
@@ -230,6 +312,7 @@ class HubSpotClient:
         email: str | None = None,
         phone: str | None = None,
     ) -> HubSpotContactSnapshot:
+        self._assert_write_activation()
         record_id = _record_id(contact_id)
         properties: dict[str, str] = {}
         if email is not None:
@@ -258,6 +341,7 @@ class HubSpotClient:
         body: str,
         timestamp: datetime,
     ) -> HubSpotNoteSnapshot:
+        self._assert_write_activation()
         contact_record_id = _record_id(contact_id)
         note_body = _nonblank_text(body, max_length=MAX_NOTE_BODY_CHARS)
         if (
@@ -333,6 +417,7 @@ class HubSpotClient:
         self, note_id: str, contact_id: str
     ) -> HubSpotNoteSnapshot:
         """Repair only a verified absent Note-to-Contact association and read it back."""
+        self._assert_write_activation()
         note_record_id = _record_id(note_id)
         contact_record_id = _record_id(contact_id)
         current = await self.get_note(note_record_id)
@@ -364,6 +449,32 @@ class HubSpotClient:
         if repaired.contact_ids != (contact_record_id,):
             raise HubSpotProviderError(HubSpotErrorCode.CONFLICT, outcome_uncertain=True)
         return repaired
+
+    def _configuration_is_current(self) -> bool:
+        """Reject settings mutation so preflight evidence stays bound to its config."""
+        return (
+            self._settings.hubspot_service_key is self._service_key
+            and self._settings.hubspot_portal_id == self._expected_portal_id
+            and self._settings.hubspot_configured
+            and _valid_portal_id(self._settings.hubspot_portal_id)
+        )
+
+    def _assert_write_activation(self) -> None:
+        """Allow only isolated preflight-free test mocks; production stays fail-closed."""
+        isolated_test_transport = self._settings.app_env in {"test", "ci"} and self._mock_transport
+        if (
+            isolated_test_transport
+            and self._preflight_result is None
+            and self._configuration_is_current()
+        ):
+            return
+        if (
+            self._preflight_result is not None
+            and self._preflight_result.writes_enabled
+            and self._configuration_is_current()
+        ):
+            return
+        raise HubSpotProviderError(HubSpotErrorCode.ACTIVATION_REQUIRED)
 
     async def _request_json(
         self,
@@ -694,3 +805,67 @@ def _required_string(mapping: dict[str, Any], key: str) -> str:
     if not isinstance(value, str):
         raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
     return value
+
+
+async def preflight_hubspot(
+    settings: Settings,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> HubSpotPreflightResult:
+    """Return a safe binding result, including a no-request result if unconfigured."""
+    if not _settings_are_configured(settings):
+        return _preflight_result(HubSpotPreflightOutcome.NOT_CONFIGURED)
+    try:
+        async with HubSpotClient(settings, transport=transport) as client:
+            return await client.preflight_account()
+    except HubSpotProviderError as error:
+        return _preflight_error_result(error)
+
+
+def _settings_are_configured(settings: Settings) -> bool:
+    key = settings.hubspot_service_key
+    return (
+        key is not None
+        and bool(key.get_secret_value().strip())
+        and _valid_portal_id(settings.hubspot_portal_id)
+    )
+
+
+def _valid_portal_id(value: str | None) -> bool:
+    return isinstance(value, str) and value.isascii() and value.isdecimal() and int(value) > 0
+
+
+def _preflight_result(
+    outcome: HubSpotPreflightOutcome,
+    *,
+    account_identity_verified: bool = False,
+) -> HubSpotPreflightResult:
+    return HubSpotPreflightResult(
+        outcome=outcome,
+        account_identity_verified=account_identity_verified,
+        capability_status=HubSpotCapabilityStatus.UNVERIFIED,
+    )
+
+
+def _preflight_error_result(error: HubSpotProviderError) -> HubSpotPreflightResult:
+    if error.code in {
+        HubSpotErrorCode.UNAUTHORIZED,
+        HubSpotErrorCode.PERMISSION_DENIED,
+    }:
+        outcome = HubSpotPreflightOutcome.PERMISSION_DENIED
+    elif error.code is HubSpotErrorCode.NOT_CONFIGURED:
+        outcome = HubSpotPreflightOutcome.NOT_CONFIGURED
+    elif error.code in {
+        HubSpotErrorCode.TIMEOUT,
+        HubSpotErrorCode.RATE_LIMITED,
+        HubSpotErrorCode.PROVIDER_UNAVAILABLE,
+    }:
+        outcome = HubSpotPreflightOutcome.PROVIDER_UNAVAILABLE
+    elif error.code in {
+        HubSpotErrorCode.INVALID_RESPONSE,
+        HubSpotErrorCode.RESPONSE_TOO_LARGE,
+    }:
+        outcome = HubSpotPreflightOutcome.INVALID_RESPONSE
+    else:
+        outcome = HubSpotPreflightOutcome.VERIFICATION_UNAVAILABLE
+    return _preflight_result(outcome)
