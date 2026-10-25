@@ -210,13 +210,18 @@ class HubSpotClient:
         properties: dict[str, str] = {"email": _nonblank_text(email, max_length=254)}
         if phone is not None:
             properties["phone"] = _nonblank_text(phone, max_length=64)
-        payload = await self._request_json(
-            "POST",
-            "/crm/objects/2026-09/contacts",
-            json_body={"properties": properties},
-            write=True,
-        )
-        return _parse_contact(payload)
+        try:
+            payload = await self._request_json(
+                "POST",
+                "/crm/objects/2026-09/contacts",
+                json_body={"properties": properties},
+                write=True,
+            )
+            return _parse_contact(payload)
+        except HubSpotProviderError as error:
+            if error.code is HubSpotErrorCode.INVALID_RESPONSE:
+                raise _uncertain(error) from None
+            raise
 
     async def update_contact(
         self,
@@ -233,13 +238,18 @@ class HubSpotClient:
             properties["phone"] = _nonblank_text(phone, max_length=64)
         if not properties:
             raise HubSpotProviderError(HubSpotErrorCode.INVALID_REQUEST)
-        payload = await self._request_json(
-            "PATCH",
-            f"/crm/objects/2026-09/contacts/{record_id}",
-            json_body={"properties": properties},
-            write=True,
-        )
-        return _parse_contact(payload)
+        try:
+            payload = await self._request_json(
+                "PATCH",
+                f"/crm/objects/2026-09/contacts/{record_id}",
+                json_body={"properties": properties},
+                write=True,
+            )
+            return _parse_contact(payload)
+        except HubSpotProviderError as error:
+            if error.code is HubSpotErrorCode.INVALID_RESPONSE:
+                raise _uncertain(error) from None
+            raise
 
     async def create_note(
         self,
@@ -259,26 +269,31 @@ class HubSpotClient:
         timestamp_value = (
             timestamp.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         )
-        payload = await self._request_json(
-            "POST",
-            "/crm/objects/2026-09/notes",
-            json_body={
-                "properties": {"hs_timestamp": timestamp_value, "hs_note_body": note_body},
-                "associations": [
-                    {
-                        "to": {"id": contact_record_id},
-                        "types": [
-                            {
-                                "associationCategory": "HUBSPOT_DEFINED",
-                                "associationTypeId": NOTE_TO_CONTACT_ASSOCIATION_TYPE_ID,
-                            }
-                        ],
-                    }
-                ],
-            },
-            write=True,
-        )
-        return _parse_note(payload)
+        try:
+            payload = await self._request_json(
+                "POST",
+                "/crm/objects/2026-09/notes",
+                json_body={
+                    "properties": {"hs_timestamp": timestamp_value, "hs_note_body": note_body},
+                    "associations": [
+                        {
+                            "to": {"id": contact_record_id},
+                            "types": [
+                                {
+                                    "associationCategory": "HUBSPOT_DEFINED",
+                                    "associationTypeId": NOTE_TO_CONTACT_ASSOCIATION_TYPE_ID,
+                                }
+                            ],
+                        }
+                    ],
+                },
+                write=True,
+            )
+            return _parse_note(payload)
+        except HubSpotProviderError as error:
+            if error.code is HubSpotErrorCode.INVALID_RESPONSE:
+                raise _uncertain(error) from None
+            raise
 
     async def search_notes(
         self, marker: str, *, after: str | None = None
@@ -326,16 +341,28 @@ class HubSpotClient:
         if current.contact_ids:
             raise HubSpotProviderError(HubSpotErrorCode.CONFLICT)
 
-        await self._request_empty(
-            "PUT",
-            "/crm/objects/2026-09/notes/"
-            f"{note_record_id}/associations/contact/{contact_record_id}/"
-            f"{NOTE_TO_CONTACT_ASSOCIATION_TYPE_ID}",
-            write=True,
-        )
-        repaired = await self.get_note(note_record_id)
+        try:
+            await self._request_empty(
+                "PUT",
+                "/crm/objects/2026-09/notes/"
+                f"{note_record_id}/associations/contact/{contact_record_id}/"
+                f"{NOTE_TO_CONTACT_ASSOCIATION_TYPE_ID}",
+                write=True,
+            )
+        except HubSpotProviderError as error:
+            if error.code in {
+                HubSpotErrorCode.INVALID_RESPONSE,
+                HubSpotErrorCode.RESPONSE_TOO_LARGE,
+            }:
+                raise _uncertain(error) from None
+            raise
+
+        try:
+            repaired = await self.get_note(note_record_id)
+        except HubSpotProviderError as error:
+            raise _uncertain(error) from None
         if repaired.contact_ids != (contact_record_id,):
-            raise HubSpotProviderError(HubSpotErrorCode.CONFLICT)
+            raise HubSpotProviderError(HubSpotErrorCode.CONFLICT, outcome_uncertain=True)
         return repaired
 
     async def _request_json(
@@ -352,10 +379,12 @@ class HubSpotClient:
         )
         try:
             parsed = json.loads(response_body)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE) from None
+        except (UnicodeDecodeError, ValueError):
+            raise HubSpotProviderError(
+                HubSpotErrorCode.INVALID_RESPONSE, outcome_uncertain=write
+            ) from None
         if not isinstance(parsed, dict):
-            raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
+            raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE, outcome_uncertain=write)
         return parsed
 
     async def _request_empty(
@@ -369,10 +398,14 @@ class HubSpotClient:
         if body:
             try:
                 parsed = json.loads(body)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE) from None
+            except (UnicodeDecodeError, ValueError):
+                raise HubSpotProviderError(
+                    HubSpotErrorCode.INVALID_RESPONSE, outcome_uncertain=write
+                ) from None
             if not isinstance(parsed, dict):
-                raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
+                raise HubSpotProviderError(
+                    HubSpotErrorCode.INVALID_RESPONSE, outcome_uncertain=write
+                )
 
     async def _request_bytes(
         self,
@@ -403,26 +436,41 @@ class HubSpotClient:
                     and declared_length.isdecimal()
                     and int(declared_length) > MAX_RESPONSE_BYTES
                 ):
-                    raise HubSpotProviderError(HubSpotErrorCode.RESPONSE_TOO_LARGE)
+                    raise HubSpotProviderError(
+                        HubSpotErrorCode.RESPONSE_TOO_LARGE,
+                        outcome_uncertain=write,
+                    )
                 chunks = bytearray()
                 async for chunk in response.aiter_bytes():
                     if len(chunks) + len(chunk) > MAX_RESPONSE_BYTES:
-                        raise HubSpotProviderError(HubSpotErrorCode.RESPONSE_TOO_LARGE)
+                        raise HubSpotProviderError(
+                            HubSpotErrorCode.RESPONSE_TOO_LARGE,
+                            outcome_uncertain=write,
+                        )
                     chunks.extend(chunk)
                 if expect_json and not chunks:
-                    raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
+                    raise HubSpotProviderError(
+                        HubSpotErrorCode.INVALID_RESPONSE,
+                        outcome_uncertain=write,
+                    )
                 return bytes(chunks)
         except HubSpotProviderError:
             raise
         except httpx.ConnectTimeout:
-            raise HubSpotProviderError(HubSpotErrorCode.TIMEOUT) from None
+            raise HubSpotProviderError(
+                HubSpotErrorCode.TIMEOUT,
+                outcome_uncertain=write and response is not None,
+            ) from None
         except (httpx.TimeoutException, TimeoutError):
             raise HubSpotProviderError(
                 HubSpotErrorCode.TIMEOUT,
                 outcome_uncertain=write,
             ) from None
         except httpx.ConnectError:
-            raise HubSpotProviderError(HubSpotErrorCode.PROVIDER_UNAVAILABLE) from None
+            raise HubSpotProviderError(
+                HubSpotErrorCode.PROVIDER_UNAVAILABLE,
+                outcome_uncertain=write and response is not None,
+            ) from None
         except httpx.RequestError:
             raise HubSpotProviderError(
                 HubSpotErrorCode.PROVIDER_UNAVAILABLE,
@@ -461,6 +509,18 @@ def _status_error(response: httpx.Response, *, write: bool) -> HubSpotProviderEr
     )
 
 
+def _uncertain(error: HubSpotProviderError) -> HubSpotProviderError:
+    """Mark an unusable post-write response without exposing its source details."""
+    if error.outcome_uncertain:
+        return error
+    return HubSpotProviderError(
+        error.code,
+        status_code=error.status_code,
+        retry_after_seconds=error.retry_after_seconds,
+        outcome_uncertain=True,
+    )
+
+
 def _retry_after(value: str | None) -> int | None:
     if value is None:
         return None
@@ -477,13 +537,13 @@ def _retry_after(value: str | None) -> int | None:
 
 
 def _record_id(value: str) -> str:
-    if (
-        not isinstance(value, str)
-        or not value.isascii()
-        or not value.isdecimal()
-        or int(value) <= 0
-    ):
+    if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
         raise HubSpotProviderError(HubSpotErrorCode.INVALID_REQUEST)
+    try:
+        if int(value) <= 0:
+            raise HubSpotProviderError(HubSpotErrorCode.INVALID_REQUEST)
+    except ValueError:
+        raise HubSpotProviderError(HubSpotErrorCode.INVALID_REQUEST) from None
     return value
 
 
@@ -565,7 +625,10 @@ def _parse_contact(payload: dict[str, Any]) -> HubSpotContactSnapshot:
     properties = payload.get("properties")
     if not isinstance(record_id, str) or not isinstance(properties, dict):
         raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
-    record_id = _record_id(record_id)
+    try:
+        record_id = _record_id(record_id)
+    except HubSpotProviderError:
+        raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE) from None
     archived = payload.get("archived", False)
     if not isinstance(archived, bool):
         raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
@@ -583,7 +646,10 @@ def _parse_note(payload: dict[str, Any]) -> HubSpotNoteSnapshot:
     properties = payload.get("properties")
     if not isinstance(record_id, str) or not isinstance(properties, dict):
         raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
-    record_id = _record_id(record_id)
+    try:
+        record_id = _record_id(record_id)
+    except HubSpotProviderError:
+        raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE) from None
     archived = payload.get("archived", False)
     if not isinstance(archived, bool):
         raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
@@ -600,7 +666,10 @@ def _parse_note(payload: dict[str, Any]) -> HubSpotNoteSnapshot:
             results = contacts.get("results", [])
             if not isinstance(results, list) or any(not isinstance(item, dict) for item in results):
                 raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
-            contact_ids = tuple(_record_id(_required_string(item, "id")) for item in results)
+            try:
+                contact_ids = tuple(_record_id(_required_string(item, "id")) for item in results)
+            except HubSpotProviderError:
+                raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE) from None
 
     return HubSpotNoteSnapshot(
         id=record_id,

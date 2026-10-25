@@ -469,6 +469,7 @@ async def test_oversized_and_unexpected_provider_responses_are_rejected() -> Non
         with pytest.raises(HubSpotProviderError) as oversized_error:
             await client.get_contact_by_id("987654")
     assert oversized_error.value.code is HubSpotErrorCode.RESPONSE_TOO_LARGE
+    assert oversized_error.value.outcome_uncertain is False
 
     async def malformed_handler(request: httpx.Request) -> httpx.Response:
         return json_response({"results": "not-a-list"})
@@ -479,6 +480,7 @@ async def test_oversized_and_unexpected_provider_responses_are_rejected() -> Non
         with pytest.raises(HubSpotProviderError) as malformed_error:
             await client.get_contact_by_id("987654")
     assert malformed_error.value.code is HubSpotErrorCode.INVALID_RESPONSE
+    assert malformed_error.value.outcome_uncertain is False
 
 
 @pytest.mark.asyncio
@@ -527,3 +529,174 @@ def test_incomplete_configuration_fails_before_client_creation(
         HubSpotClient(incomplete_settings)
 
     assert exc_info.value.code is HubSpotErrorCode.NOT_CONFIGURED
+
+
+@pytest.mark.asyncio
+async def test_contact_create_accepted_with_malformed_json_is_uncertain_and_redacted() -> None:
+    body_sentinel = "accepted-write-response-private-marker"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            201,
+            content=f'{{"detail":"{body_sentinel} {AUTH_VALUE}"'.encode(),
+        )
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(HubSpotProviderError) as exc_info:
+            await client.create_contact(email="customer@example.com")
+
+    error = exc_info.value
+    assert error.code is HubSpotErrorCode.INVALID_RESPONSE
+    assert error.outcome_uncertain is True
+    assert body_sentinel not in str(error)
+    assert body_sentinel not in repr(error)
+    assert AUTH_VALUE not in str(error)
+    assert AUTH_VALUE not in repr(error)
+    assert error.__cause__ is None
+
+
+@pytest.mark.parametrize("response_body", [b"[]", b""], ids=["json-array", "empty-body"])
+@pytest.mark.asyncio
+async def test_accepted_contact_create_with_non_object_or_empty_body_is_uncertain(
+    response_body: bytes,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, content=response_body)
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(HubSpotProviderError) as exc_info:
+            await client.create_contact(email="customer@example.com")
+
+    assert exc_info.value.code is HubSpotErrorCode.INVALID_RESPONSE
+    assert exc_info.value.outcome_uncertain is True
+
+
+@pytest.mark.asyncio
+async def test_contact_create_accepted_without_record_id_is_uncertain() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return json_response({"properties": {"email": "customer@example.com"}}, 201)
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(HubSpotProviderError) as exc_info:
+            await client.create_contact(email="customer@example.com")
+
+    assert exc_info.value.code is HubSpotErrorCode.INVALID_RESPONSE
+    assert exc_info.value.outcome_uncertain is True
+
+
+@pytest.mark.asyncio
+async def test_contact_update_accepted_with_malformed_snapshot_is_uncertain() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return json_response({"id": "987654", "properties": "unexpected"}, 200)
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(HubSpotProviderError) as exc_info:
+            await client.update_contact("987654", phone="+966501234567")
+
+    assert exc_info.value.code is HubSpotErrorCode.INVALID_RESPONSE
+    assert exc_info.value.outcome_uncertain is True
+
+
+@pytest.mark.asyncio
+async def test_note_create_accepted_with_malformed_json_is_uncertain() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, content=b"{malformed")
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(HubSpotProviderError) as exc_info:
+            await client.create_note(
+                "987654",
+                body="Booking confirmed. source-op:abc123",
+                timestamp=datetime(2026, 10, 25, 10, 30, tzinfo=UTC),
+            )
+
+    assert exc_info.value.code is HubSpotErrorCode.INVALID_RESPONSE
+    assert exc_info.value.outcome_uncertain is True
+
+
+@pytest.mark.asyncio
+async def test_note_create_accepted_without_note_id_is_uncertain() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(
+            {"properties": {"hs_note_body": "source-op:abc123", "hs_timestamp": "now"}}, 201
+        )
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(HubSpotProviderError) as exc_info:
+            await client.create_note(
+                "987654",
+                body="Booking confirmed. source-op:abc123",
+                timestamp=datetime(2026, 10, 25, 10, 30, tzinfo=UTC),
+            )
+
+    assert exc_info.value.code is HubSpotErrorCode.INVALID_RESPONSE
+    assert exc_info.value.outcome_uncertain is True
+
+
+@pytest.mark.asyncio
+async def test_accepted_contact_create_with_oversized_response_is_uncertain() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, content=b"{" + b" " * (1024 * 1024) + b"}")
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(HubSpotProviderError) as exc_info:
+            await client.create_contact(email="customer@example.com")
+
+    assert exc_info.value.code is HubSpotErrorCode.RESPONSE_TOO_LARGE
+    assert exc_info.value.outcome_uncertain is True
+
+
+@pytest.mark.asyncio
+async def test_malformed_read_response_remains_non_uncertain() -> None:
+    body_sentinel = "read-response-private-marker"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=f'{{"detail":"{body_sentinel}"'.encode())
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(HubSpotProviderError) as exc_info:
+            await client.get_contact_by_id("987654")
+
+    error = exc_info.value
+    assert error.code is HubSpotErrorCode.INVALID_RESPONSE
+    assert error.outcome_uncertain is False
+    assert body_sentinel not in str(error)
+    assert body_sentinel not in repr(error)
+
+
+@pytest.mark.asyncio
+async def test_association_write_with_unusable_readback_is_uncertain_without_second_put() -> None:
+    requests: list[httpx.Request] = []
+    response_body_sentinel = "association-readback-private-marker"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "PUT":
+            return httpx.Response(204)
+        if (
+            request.method == "GET"
+            and len([item for item in requests if item.method == "GET"]) == 1
+        ):
+            return json_response(
+                {
+                    "id": "654321",
+                    "properties": {"hs_note_body": "source-op:abc123", "hs_timestamp": "now"},
+                    "associations": {"contacts": {"results": []}},
+                }
+            )
+        return httpx.Response(
+            200,
+            content=f'{{"detail":"{response_body_sentinel}"'.encode(),
+        )
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(HubSpotProviderError) as exc_info:
+            await client.ensure_note_contact_association("654321", "987654")
+
+    error = exc_info.value
+    assert error.code is HubSpotErrorCode.INVALID_RESPONSE
+    assert error.outcome_uncertain is True
+    assert response_body_sentinel not in str(error)
+    assert response_body_sentinel not in repr(error)
+    assert AUTH_VALUE not in repr(error)
+    assert sum(request.method == "PUT" for request in requests) == 1
