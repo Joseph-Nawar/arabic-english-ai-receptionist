@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     google_oauth_client_secret: SecretStr | None = Field(default=None, repr=False)
     google_oauth_refresh_token: SecretStr | None = Field(default=None, repr=False)
     google_calendar_request_timeout_seconds: float = Field(default=10.0, gt=0, le=30)
+    hubspot_service_key: SecretStr | None = Field(default=None, repr=False)
+    hubspot_portal_id: str | None = None
+    hubspot_request_timeout_seconds: float = Field(default=10.0, gt=0, le=30)
 
     model_config = SettingsConfigDict(
         env_prefix="RECEPTIONIST_",
@@ -50,6 +53,25 @@ class Settings(BaseSettings):
             raise ValueError("google_calendar_id must not be blank")
         return value
 
+    @field_validator("hubspot_service_key")
+    @classmethod
+    def validate_hubspot_service_key(cls, value: SecretStr | None) -> SecretStr | None:
+        """Reject a supplied key that contains only whitespace without exposing it."""
+        if value is not None and not value.get_secret_value().strip():
+            raise ValueError("hubspot_service_key must not be blank")
+        return value
+
+    @field_validator("hubspot_portal_id")
+    @classmethod
+    def validate_hubspot_portal_id(cls, value: str | None) -> str | None:
+        """Accept only positive decimal HubSpot account identifiers."""
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized.isascii() or not normalized.isdecimal() or int(normalized) <= 0:
+            raise ValueError("hubspot_portal_id must be a positive decimal identifier")
+        return normalized
+
     @property
     def database_url_value(self) -> str:
         """Return the URL for SQLAlchemy internals; callers must not log it."""
@@ -71,6 +93,15 @@ class Settings(BaseSettings):
             for value in required_values
         )
 
+    @property
+    def hubspot_configured(self) -> bool:
+        """Return whether the key and expected account identifier are both present."""
+        return bool(
+            self.hubspot_service_key is not None
+            and self.hubspot_service_key.get_secret_value().strip()
+            and self.hubspot_portal_id is not None
+        )
+
     def safe_summary(self) -> dict[str, str | bool | float]:
         """Return configuration details safe for ordinary logs."""
         return {
@@ -79,6 +110,8 @@ class Settings(BaseSettings):
             "database_configured": True,
             "google_calendar_configured": self.google_calendar_configured,
             "google_calendar_request_timeout_seconds": self.google_calendar_request_timeout_seconds,
+            "hubspot_configured": self.hubspot_configured,
+            "hubspot_request_timeout_seconds": self.hubspot_request_timeout_seconds,
         }
 
 
