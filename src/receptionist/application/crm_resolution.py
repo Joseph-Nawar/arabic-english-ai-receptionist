@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -458,7 +459,7 @@ async def _load_local_state(
             session,
             conversation_id=request.conversation_id,
             tool_name=_OPERATION,
-            idempotency_key=request.idempotency_key,
+            idempotency_key=_durable_idempotency_key(request.idempotency_key),
             sanitized_arguments=arguments,
         )
         if claim.outcome is ToolExecutionClaimOutcome.IDEMPOTENCY_CONFLICT:
@@ -1155,6 +1156,11 @@ def _settings_configured(settings: Settings) -> bool:
         and portal_id.isdecimal()
         and int(portal_id) > 0
     )
+
+
+def _durable_idempotency_key(value: str) -> str:
+    """Keep caller-supplied key material out of durable ToolExecution rows."""
+    return hashlib.sha256(value.encode("ascii")).hexdigest()
 
 
 def _settings_unchanged(

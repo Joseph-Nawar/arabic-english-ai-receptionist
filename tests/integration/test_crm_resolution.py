@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -585,7 +586,10 @@ async def test_provider_error_payload_is_excluded_from_durable_json(session_fact
 
     async with session_factory() as session:
         execution = await session.scalar(
-            select(ToolExecution).where(ToolExecution.idempotency_key == request.idempotency_key)
+            select(ToolExecution).where(
+                ToolExecution.idempotency_key
+                == hashlib.sha256(request.idempotency_key.encode("ascii")).hexdigest()
+            )
         )
         audit = await session.scalar(
             select(AuditEvent)
@@ -686,13 +690,16 @@ async def test_pii_is_excluded_from_durable_execution_and_audit_json(session_fac
     candidate = _contact_payload(_provider_id("722"), email=email, phone=phone)
     provider.search_body = _search(candidate)
     provider.contact_by_email[email] = (200, candidate)
-    request = _request(contact_id, conversation_id, email=email)
+    request = _request(contact_id, conversation_id, email=email, key=phone.removeprefix("+"))
 
     result = await _resolve(session_factory, request, provider)
 
     async with session_factory() as session:
         execution = await session.scalar(
-            select(ToolExecution).where(ToolExecution.idempotency_key == request.idempotency_key)
+            select(ToolExecution).where(
+                ToolExecution.idempotency_key
+                == hashlib.sha256(request.idempotency_key.encode("ascii")).hexdigest()
+            )
         )
         audit = await session.scalar(
             select(AuditEvent)
@@ -702,6 +709,7 @@ async def test_pii_is_excluded_from_durable_execution_and_audit_json(session_fac
     persisted = json.dumps(
         {
             "result": result.model_dump(mode="json"),
+            "idempotency_key": execution.idempotency_key if execution else None,
             "arguments": execution.sanitized_arguments if execution else None,
             "stored_result": execution.sanitized_result if execution else None,
             "audit": audit.sanitized_metadata if audit else None,
@@ -713,6 +721,7 @@ async def test_pii_is_excluded_from_durable_execution_and_audit_json(session_fac
     assert execution is not None and audit is not None
     assert email not in persisted
     assert phone not in persisted
+    assert phone.removeprefix("+") not in persisted
     assert AUTH_SENTINEL not in persisted
     assert result.next_action is CRMResolutionNextAction.NONE
 
