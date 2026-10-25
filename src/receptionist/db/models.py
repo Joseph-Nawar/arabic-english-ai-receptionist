@@ -24,7 +24,7 @@ from sqlalchemy import (
     Enum as SAEnum,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, MappedColumn, mapped_column
+from sqlalchemy.orm import Mapped, MappedColumn, mapped_column, validates
 
 from receptionist.db.base import Base
 from receptionist.domain.enums import (
@@ -44,6 +44,7 @@ from receptionist.domain.enums import (
     PendingActionType,
     ToolExecutionStatus,
 )
+from receptionist.domain.identity import CRMContactLinkProvenance
 
 
 def _enum_type(enum_class: type[StrEnum], name: str) -> SAEnum:
@@ -147,6 +148,63 @@ class Contact(Base):
             postgresql_where=text("phone_e164 IS NOT NULL"),
         ),
     )
+
+
+class CRMContactLinkState(StrEnum):
+    ACTIVE = "active"
+    STALE = "stale"
+
+
+class CRMContactLink(Base):
+    __tablename__ = "crm_contact_link"
+
+    contact_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("contact.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    hubspot_portal_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    hubspot_contact_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    linked_by: Mapped[CRMContactLinkProvenance] = mapped_column(
+        _enum_type(CRMContactLinkProvenance, "crm_contact_link_linked_by"), nullable=False
+    )
+    state: Mapped[CRMContactLinkState] = mapped_column(
+        _enum_type(CRMContactLinkState, "crm_contact_link_state"), nullable=False
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = _created_at_column()
+    updated_at: Mapped[datetime] = _updated_at_column()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "hubspot_portal_id",
+            "hubspot_contact_id",
+            name="uq_crm_contact_link_portal_contact",
+        ),
+        CheckConstraint(
+            "hubspot_portal_id ~ '^[0-9]+$' AND hubspot_portal_id ~ '[1-9]'",
+            name="ck_crm_contact_link_portal_id_positive_decimal",
+        ),
+    )
+
+    @validates("hubspot_portal_id")
+    def validate_hubspot_portal_id(self, _: str, value: str) -> str:
+        if not (
+            isinstance(value, str) and value.isascii() and value.isdecimal() and int(value) > 0
+        ):
+            raise ValueError("HubSpot portal ID must be a positive decimal identifier")
+        return value
+
+    @validates("hubspot_contact_id")
+    def validate_hubspot_contact_id(self, _: str, value: str) -> str:
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or value != value.strip()
+            or len(value) > 255
+        ):
+            raise ValueError("HubSpot provider Contact ID must be nonblank and bounded")
+        return value
 
 
 class Conversation(Base):

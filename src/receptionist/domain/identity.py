@@ -2,8 +2,17 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 import phonenumbers
 from phonenumbers import NumberParseException
+
+
+class CRMContactLinkProvenance(StrEnum):
+    """Identity evidence that justified linking a local Contact to HubSpot."""
+
+    PHONE_E164 = "phone_e164"
+    VERIFIED_EMAIL = "verified_email"
 
 
 class PhoneNormalizationError(ValueError):
