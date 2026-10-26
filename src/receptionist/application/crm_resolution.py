@@ -11,7 +11,7 @@ from typing import Literal
 from uuid import UUID
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -215,10 +215,52 @@ async def resolve_crm_contact(
         return loaded
     snapshot = loaded
 
-    if snapshot.configuration_missing:
+    try:
+        async with session_factory() as operation_session:
+            async with operation_session.begin():
+                execution = await operation_session.scalar(
+                    select(ToolExecution)
+                    .where(ToolExecution.id == snapshot.execution_id)
+                    .with_for_update()
+                )
+                if execution is None:
+                    raise _TerminalizationError
+                result = await _resolve_claimed_contact(
+                    session_factory,
+                    snapshot,
+                    request,
+                    settings,
+                    transport=transport,
+                    operation_session=operation_session,
+                )
+            return result
+    except (SQLAlchemyError, _TerminalizationError):
         return await _finish(
             session_factory,
             snapshot,
+            _persistence_failure(snapshot.replayed),
+        )
+
+
+async def _resolve_claimed_contact(
+    session_factory: async_sessionmaker[AsyncSession],
+    snapshot: _ResolutionSnapshot,
+    request: CRMContactResolutionRequest,
+    settings: Settings,
+    *,
+    transport: httpx.AsyncBaseTransport | None,
+    operation_session: AsyncSession,
+) -> CRMContactResolutionResult:
+    async def finish(result: CRMContactResolutionResult) -> CRMContactResolutionResult:
+        return await _finish(
+            session_factory,
+            snapshot,
+            result,
+            session=operation_session,
+        )
+
+    if snapshot.configuration_missing:
+        return await finish(
             _result(
                 CRMContactResolutionOutcome.NOT_CONFIGURED,
                 replayed=snapshot.replayed,
@@ -229,17 +271,13 @@ async def resolve_crm_contact(
 
     trusted_email, evidence_error = _effective_verified_email(snapshot, request)
     if evidence_error is not None:
-        return await _finish(
-            session_factory,
-            snapshot,
+        return await finish(
             evidence_error.model_copy(update={"replayed": snapshot.replayed}),
         )
 
     if snapshot.link is not None:
         if not _settings_configured(settings):
-            return await _finish(
-                session_factory,
-                snapshot,
+            return await finish(
                 _result(
                     CRMContactResolutionOutcome.NOT_CONFIGURED,
                     replayed=snapshot.replayed,
@@ -248,9 +286,7 @@ async def resolve_crm_contact(
                 ),
             )
         if snapshot.link.portal_id != settings.hubspot_portal_id:
-            return await _finish(
-                session_factory,
-                snapshot,
+            return await finish(
                 _result(
                     CRMContactResolutionOutcome.IDENTITY_CONFLICT,
                     replayed=snapshot.replayed,
@@ -259,9 +295,7 @@ async def resolve_crm_contact(
                 ),
             )
     elif snapshot.phone_e164 is None and trusted_email is None:
-        return await _finish(
-            session_factory,
-            snapshot,
+        return await finish(
             _result(
                 CRMContactResolutionOutcome.UNRESOLVED_IDENTITY,
                 replayed=snapshot.replayed,
@@ -269,9 +303,7 @@ async def resolve_crm_contact(
         )
 
     if not _settings_configured(settings):
-        return await _finish(
-            session_factory,
-            snapshot,
+        return await finish(
             _result(
                 CRMContactResolutionOutcome.NOT_CONFIGURED,
                 replayed=snapshot.replayed,
@@ -285,9 +317,7 @@ async def resolve_crm_contact(
     try:
         client = HubSpotClient(settings, transport=transport)
     except HubSpotProviderError as error:
-        return await _finish(
-            session_factory,
-            snapshot,
+        return await finish(
             _provider_error_result(error, replayed=snapshot.replayed),
         )
 
@@ -295,7 +325,7 @@ async def resolve_crm_contact(
         preflight = await client.preflight_account()
         preflight_failure = _preflight_failure(preflight, replayed=snapshot.replayed)
         if preflight_failure is not None:
-            return await _finish(session_factory, snapshot, preflight_failure)
+            return await finish(preflight_failure)
 
         if snapshot.link is not None and snapshot.link.state is CRMContactLinkState.ACTIVE:
             active_link = snapshot.link
@@ -303,9 +333,7 @@ async def resolve_crm_contact(
                 provider_snapshot = await client.get_contact_by_id(active_link.hubspot_contact_id)
             except HubSpotProviderError as error:
                 if error.code is not HubSpotErrorCode.NOT_FOUND:
-                    return await _finish(
-                        session_factory,
-                        snapshot,
+                    return await finish(
                         _provider_error_result(error, replayed=snapshot.replayed),
                     )
                 provider_snapshot = None
@@ -313,16 +341,14 @@ async def resolve_crm_contact(
             if provider_snapshot is None or provider_snapshot.archived:
                 stale_result = await _mark_link_stale(session_factory, snapshot)
                 if stale_result is not None:
-                    return await _finish(session_factory, snapshot, stale_result)
+                    return await finish(stale_result)
                 snapshot = replace(
                     snapshot,
                     link=replace(active_link, state=CRMContactLinkState.STALE),
                 )
             else:
                 if provider_snapshot.id != active_link.hubspot_contact_id:
-                    return await _finish(
-                        session_factory,
-                        snapshot,
+                    return await finish(
                         _result(
                             CRMContactResolutionOutcome.PROVIDER_UNAVAILABLE,
                             replayed=snapshot.replayed,
@@ -339,17 +365,13 @@ async def resolve_crm_contact(
                         replayed=snapshot.replayed,
                     )
                 except HubSpotProviderError as error:
-                    return await _finish(
-                        session_factory,
-                        snapshot,
+                    return await finish(
                         _provider_error_result(error, replayed=snapshot.replayed),
                     )
                 if verified_result is not None:
-                    return await _finish(session_factory, snapshot, verified_result)
+                    return await finish(verified_result)
                 if not _settings_unchanged(settings, service_key, expected_portal_id):
-                    return await _finish(
-                        session_factory,
-                        snapshot,
+                    return await finish(
                         _result(
                             CRMContactResolutionOutcome.NOT_CONFIGURED,
                             replayed=snapshot.replayed,
@@ -368,14 +390,13 @@ async def resolve_crm_contact(
                     provenance=active_link.linked_by,
                     trusted_email=trusted_email,
                     relinking=False,
+                    operation_session=operation_session,
                 )
         elif snapshot.link is not None:
             pass  # A previously verified stale link is searched, never fetched by old ID.
 
         if not _settings_unchanged(settings, service_key, expected_portal_id):
-            return await _finish(
-                session_factory,
-                snapshot,
+            return await finish(
                 _result(
                     CRMContactResolutionOutcome.NOT_CONFIGURED,
                     replayed=snapshot.replayed,
@@ -392,17 +413,13 @@ async def resolve_crm_contact(
                 default_region=snapshot.default_phone_region or "",
             )
         except HubSpotProviderError as error:
-            return await _finish(
-                session_factory,
-                snapshot,
+            return await finish(
                 _provider_error_result(error, replayed=snapshot.replayed),
             )
 
     if identity.outcome is CRMContactIdentityOutcome.MATCHED:
         if identity.hubspot_contact_id is None or identity.linked_by is None:
-            return await _finish(
-                session_factory,
-                snapshot,
+            return await finish(
                 _result(
                     CRMContactResolutionOutcome.PROVIDER_UNAVAILABLE,
                     replayed=snapshot.replayed,
@@ -411,9 +428,7 @@ async def resolve_crm_contact(
                 ),
             )
         if not _settings_unchanged(settings, service_key, expected_portal_id):
-            return await _finish(
-                session_factory,
-                snapshot,
+            return await finish(
                 _result(
                     CRMContactResolutionOutcome.NOT_CONFIGURED,
                     replayed=snapshot.replayed,
@@ -432,14 +447,13 @@ async def resolve_crm_contact(
             provenance=identity.linked_by,
             trusted_email=trusted_email,
             relinking=snapshot.link is not None,
+            operation_session=operation_session,
         )
 
     outcome = _decision_outcome(identity.outcome)
     if outcome is CRMContactResolutionOutcome.NOT_FOUND and snapshot.link is not None:
         outcome = CRMContactResolutionOutcome.STALE_MAPPING
-    return await _finish(
-        session_factory,
-        snapshot,
+    return await finish(
         _result(
             outcome,
             replayed=snapshot.replayed,
@@ -485,11 +499,26 @@ async def _load_local_state(
             "trusted_email_supplied": request.trusted_verified_email is not None,
             "trusted_email_identity_tag": trusted_email_tag,
         }
+        durable_key = _durable_idempotency_key(request.idempotency_key)
+        active_execution = await session.scalar(
+            select(ToolExecution).where(
+                ToolExecution.conversation_id == request.conversation_id,
+                ToolExecution.tool_name == _OPERATION,
+                ToolExecution.status == ToolExecutionStatus.STARTED,
+                ToolExecution.idempotency_key != durable_key,
+            )
+        )
+        if active_execution is not None:
+            return _result(
+                CRMContactResolutionOutcome.OPERATION_IN_PROGRESS,
+                error_code=CRMResolutionErrorCode.OPERATION_IN_PROGRESS,
+                next_action=CRMResolutionNextAction.RETRY_SAME_KEY,
+            )
         claim = await _claim_tool_execution(
             session,
             conversation_id=request.conversation_id,
             tool_name=_OPERATION,
-            idempotency_key=_durable_idempotency_key(request.idempotency_key),
+            idempotency_key=durable_key,
             sanitized_arguments=arguments,
         )
         if claim.outcome is ToolExecutionClaimOutcome.IDEMPOTENCY_CONFLICT:
@@ -504,7 +533,6 @@ async def _load_local_state(
                 error_code=CRMResolutionErrorCode.OPERATION_IN_PROGRESS,
                 next_action=CRMResolutionNextAction.RETRY_SAME_KEY,
             )
-
         link = await session.get(CRMContactLink, request.contact_id)
         link_snapshot = (
             None
@@ -732,17 +760,24 @@ async def _apply_verified_link(
     provenance: CRMContactLinkProvenance,
     trusted_email: str | None,
     relinking: bool,
+    operation_session: AsyncSession,
 ) -> CRMContactResolutionResult:
-    if not _settings_unchanged(settings, service_key, expected_portal_id):
+    async def finish(result: CRMContactResolutionResult) -> CRMContactResolutionResult:
         return await _finish(
             session_factory,
             snapshot,
+            result,
+            session=operation_session,
+        )
+
+    if not _settings_unchanged(settings, service_key, expected_portal_id):
+        return await finish(
             _result(
                 CRMContactResolutionOutcome.NOT_CONFIGURED,
                 replayed=snapshot.replayed,
                 error_code=CRMResolutionErrorCode.ACCOUNT_MISMATCH,
                 next_action=CRMResolutionNextAction.OPERATOR_REVIEW,
-            ),
+            )
         )
 
     outcome = (
@@ -756,7 +791,8 @@ async def _apply_verified_link(
         replayed=snapshot.replayed,
     )
     try:
-        async with session_factory.begin() as session:
+        async with operation_session.begin_nested():
+            session = operation_session
             contact, conversation = await _locked_owner(session, snapshot)
             if (
                 contact is None
@@ -846,8 +882,6 @@ async def _apply_verified_link(
                 link.verified_at = datetime.now(UTC)
 
             await _terminalize(session, snapshot, success_result)
-    except _TerminalizationError:
-        return _persistence_failure(snapshot.replayed)
     except IntegrityError:
         try:
             conflict = await _provider_link_conflict(
@@ -857,15 +891,13 @@ async def _apply_verified_link(
                 contact_id=snapshot.contact_id,
             )
         except SQLAlchemyError:
-            return _persistence_failure(snapshot.replayed)
+            return await finish(_persistence_failure(snapshot.replayed))
         result = (
             _identity_conflict(snapshot.replayed)
             if conflict
             else _persistence_failure(snapshot.replayed)
         )
-        return await _finish(session_factory, snapshot, result)
-    except SQLAlchemyError:
-        return await _finish(session_factory, snapshot, _persistence_failure(snapshot.replayed))
+        return await finish(result)
     return success_result
 
 
@@ -948,9 +980,35 @@ async def _finish(
     session_factory: async_sessionmaker[AsyncSession],
     snapshot: _ResolutionSnapshot,
     result: CRMContactResolutionResult,
+    *,
+    session: AsyncSession | None = None,
 ) -> CRMContactResolutionResult:
+    if session is not None:
+        await _terminalize(session, snapshot, result)
+        return result
     try:
         async with session_factory.begin() as session:
+            execution = await session.scalar(
+                select(ToolExecution)
+                .where(ToolExecution.id == snapshot.execution_id)
+                .with_for_update()
+            )
+            if execution is None:
+                raise _TerminalizationError
+            if execution.status is not ToolExecutionStatus.STARTED:
+                if isinstance(execution.sanitized_result, dict):
+                    try:
+                        return CRMContactResolutionResult.model_validate(
+                            execution.sanitized_result
+                        ).model_copy(update={"replayed": True})
+                    except ValidationError:
+                        pass
+                return _result(
+                    CRMContactResolutionOutcome.OPERATION_IN_PROGRESS,
+                    replayed=True,
+                    error_code=CRMResolutionErrorCode.OPERATION_IN_PROGRESS,
+                    next_action=CRMResolutionNextAction.RETRY_SAME_KEY,
+                )
             await _terminalize(session, snapshot, result)
     except (SQLAlchemyError, _TerminalizationError):
         return _persistence_failure(snapshot.replayed)
