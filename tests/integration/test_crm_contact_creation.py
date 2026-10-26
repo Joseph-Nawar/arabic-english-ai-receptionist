@@ -25,6 +25,7 @@ from receptionist.application.crm_contact_writes import (
     CRMContactCreateRequest,
     CRMContactCreateResult,
     CRMContactWriteErrorCode,
+    CRMContactWriteNextAction,
 )
 from receptionist.core.config import Settings
 from receptionist.db.models import (
@@ -610,6 +611,224 @@ async def test_http_409_reconciles_exact_existing_record_without_second_post(
     assert result.hubspot_contact_id == _provider_id("37")
     assert provider.create_count == 1
     assert await _link(session_factory, contact_id) is None
+
+
+async def test_http_409_with_invisible_contact_keeps_durable_claim_uncertain(
+    session_factory,
+) -> None:
+    contact_id, conversation_id = await _owner(session_factory)
+    request = _request(contact_id, conversation_id)
+    provider = MockHubSpot()
+    provider.create_status = 409
+    provider.record_before_create_response = False
+
+    result = await _create(session_factory, request, provider)
+    execution = await _execution(session_factory, request)
+
+    assert result.outcome is CRMContactCreateOutcome.UNCERTAIN
+    assert result.error_code is CRMContactWriteErrorCode.PROVIDER_UNAVAILABLE
+    assert result.next_action is CRMContactWriteNextAction.RECONCILE_SAME_KEY
+    assert execution is not None and execution.status is ToolExecutionStatus.STARTED
+    assert execution.sanitized_result is not None
+    assert execution.sanitized_result["outcome"] == CRMContactCreateOutcome.UNCERTAIN.value
+    assert execution.safe_error_code == CRMContactWriteErrorCode.PROVIDER_UNAVAILABLE.value
+    assert execution.finished_at is None
+    assert provider.create_count == 1
+    assert await _link(session_factory, contact_id) is None
+
+
+async def test_409_invisible_same_key_replay_stays_uncertain_then_links_when_visible(
+    session_factory,
+) -> None:
+    contact_id, conversation_id = await _owner(session_factory)
+    request = _request(contact_id, conversation_id)
+    provider = MockHubSpot()
+    provider.create_status = 409
+    provider.record_before_create_response = False
+    email_reads = 0
+    record_id = _provider_id("4091")
+
+    async def delayed_email_visibility(_message: httpx.Request) -> httpx.Response:
+        nonlocal email_reads
+        email_reads += 1
+        if email_reads < 4:
+            return httpx.Response(404, json={"message": "not indexed yet"})
+        return httpx.Response(
+            200,
+            json=_payload(record_id, email=request.trusted_verified_email),
+        )
+
+    provider.email_handler = delayed_email_visibility
+    first = await _create(session_factory, request, provider)
+    invisible_replay = await _create(session_factory, request, provider)
+    pending_execution = await _execution(session_factory, request)
+    visible_replay = await _create(session_factory, request, provider)
+    final_execution = await _execution(session_factory, request)
+    link = await _link(session_factory, contact_id)
+
+    assert first.outcome is CRMContactCreateOutcome.UNCERTAIN
+    assert invisible_replay.outcome is CRMContactCreateOutcome.UNCERTAIN
+    assert pending_execution is not None
+    assert pending_execution.status is ToolExecutionStatus.STARTED
+    assert visible_replay.outcome is CRMContactCreateOutcome.REPLAYED
+    assert visible_replay.hubspot_contact_id == record_id
+    assert final_execution is not None
+    assert final_execution.status is ToolExecutionStatus.SUCCEEDED
+    assert link is not None and link.hubspot_contact_id == record_id
+    assert provider.create_count == 1
+    assert email_reads == 4
+
+
+async def test_different_key_cannot_bypass_unresolved_409_claim(session_factory) -> None:
+    contact_id, conversation_id = await _owner(session_factory)
+    first_request = _request(contact_id, conversation_id)
+    second_request = _request(contact_id, conversation_id)
+    provider = MockHubSpot()
+    provider.create_status = 409
+    provider.record_before_create_response = False
+
+    first = await _create(session_factory, first_request, provider)
+    requests_before_second_key = len(provider.requests)
+    second = await _create(session_factory, second_request, provider)
+
+    assert first.outcome is CRMContactCreateOutcome.UNCERTAIN
+    assert second.outcome is CRMContactCreateOutcome.OPERATION_IN_PROGRESS
+    assert len(provider.requests) == requests_before_second_key
+    assert provider.create_count == 1
+    assert await _link(session_factory, contact_id) is None
+
+
+async def test_409_ambiguous_phone_matches_stays_uncertain_without_repost(
+    session_factory,
+) -> None:
+    phone = f"+96650{uuid.uuid4().int % 10**7:07d}"
+    contact_id, conversation_id = await _owner(session_factory, phone=phone)
+    request = _request(contact_id, conversation_id, phone=phone)
+    provider = MockHubSpot()
+    provider.create_status = 409
+    provider.record_before_create_response = False
+    searches = 0
+
+    async def ambiguous_after_conflict(_message: httpx.Request) -> httpx.Response:
+        nonlocal searches
+        searches += 1
+        if searches == 1:
+            return httpx.Response(200, json={"results": [], "total": 0})
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    _payload(_provider_id("4092"), phone=phone),
+                    _payload(_provider_id("4093"), phone=phone),
+                ],
+                "total": 2,
+            },
+        )
+
+    provider.search_handler = ambiguous_after_conflict
+    first = await _create(session_factory, request, provider)
+    replay = await _create(session_factory, request, provider)
+    execution = await _execution(session_factory, request)
+
+    assert first.outcome is CRMContactCreateOutcome.UNCERTAIN
+    assert first.error_code is CRMContactWriteErrorCode.AMBIGUOUS_IDENTITY
+    assert replay.outcome is CRMContactCreateOutcome.UNCERTAIN
+    assert replay.error_code is CRMContactWriteErrorCode.AMBIGUOUS_IDENTITY
+    assert replay.next_action is CRMContactWriteNextAction.RECONCILE_SAME_KEY
+    assert execution is not None and execution.status is ToolExecutionStatus.STARTED
+    assert provider.create_count == 1
+    assert searches == 3
+    assert await _link(session_factory, contact_id) is None
+
+
+async def test_409_confirmed_identity_conflict_requires_review_without_clearing_claim(
+    session_factory,
+) -> None:
+    phone = f"+96650{uuid.uuid4().int % 10**7:07d}"
+    contact_id, conversation_id = await _owner(session_factory, phone=phone)
+    request = _request(contact_id, conversation_id, phone=phone)
+    provider = MockHubSpot()
+    provider.create_status = 409
+    provider.record_before_create_response = False
+    searches = 0
+    email_reads = 0
+
+    async def phone_evidence(_message: httpx.Request) -> httpx.Response:
+        nonlocal searches
+        searches += 1
+        rows = [] if searches == 1 else [_payload(_provider_id("4094"), phone=phone)]
+        return httpx.Response(200, json={"results": rows, "total": len(rows)})
+
+    async def conflicting_email_evidence(_message: httpx.Request) -> httpx.Response:
+        nonlocal email_reads
+        email_reads += 1
+        if email_reads == 1:
+            return httpx.Response(404, json={"message": "not found"})
+        return httpx.Response(
+            200,
+            json=_payload(
+                _provider_id("4095"),
+                email=request.trusted_verified_email,
+            ),
+        )
+
+    provider.search_handler = phone_evidence
+    provider.email_handler = conflicting_email_evidence
+
+    async def conflicting_create(_message: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={
+                "message": (
+                    f"{request.trusted_verified_email} {phone} "
+                    f"{AUTH_SENTINEL} private provider payload"
+                )
+            },
+        )
+
+    provider.create_handler = conflicting_create
+    first = await _create(session_factory, request, provider)
+    replay = await _create(session_factory, request, provider)
+    execution = await _execution(session_factory, request)
+
+    assert first.outcome is CRMContactCreateOutcome.UNCERTAIN
+    assert first.error_code is CRMContactWriteErrorCode.IDENTITY_CONFLICT
+    assert first.next_action is CRMContactWriteNextAction.OPERATOR_REVIEW
+    assert replay.outcome is CRMContactCreateOutcome.UNCERTAIN
+    assert replay.error_code is CRMContactWriteErrorCode.IDENTITY_CONFLICT
+    assert replay.next_action is CRMContactWriteNextAction.OPERATOR_REVIEW
+    assert execution is not None and execution.status is ToolExecutionStatus.STARTED
+    assert execution.sanitized_result is not None
+    assert execution.sanitized_result["outcome"] == CRMContactCreateOutcome.UNCERTAIN.value
+    assert execution.safe_error_code == CRMContactWriteErrorCode.IDENTITY_CONFLICT.value
+    assert execution.finished_at is None
+    assert provider.create_count == 1
+    assert await _link(session_factory, contact_id) is None
+
+    async with session_factory() as session:
+        audit_events = list(
+            (
+                await session.scalars(
+                    select(AuditEvent).where(
+                        AuditEvent.event_type == "create_crm_contact",
+                        AuditEvent.contact_id == contact_id,
+                    )
+                )
+            ).all()
+        )
+    durable = json.dumps(
+        {
+            "arguments": execution.sanitized_arguments,
+            "result": execution.sanitized_result,
+            "error": execution.safe_error_message,
+            "audit": [item.sanitized_metadata for item in audit_events],
+        }
+    )
+    assert request.trusted_verified_email not in durable
+    assert phone not in durable
+    assert request.idempotency_key not in durable
+    assert AUTH_SENTINEL not in durable
+    assert "private provider payload" not in durable
 
 
 async def test_claim_persistence_failure_prevents_every_hubspot_request(

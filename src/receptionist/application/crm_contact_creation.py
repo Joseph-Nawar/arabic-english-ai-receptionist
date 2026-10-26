@@ -463,12 +463,7 @@ async def _run_claimed_create(
                 return await _record_uncertain(
                     session_factory,
                     snapshot,
-                    _create_result(
-                        CRMContactCreateOutcome.UNCERTAIN,
-                        replayed=True,
-                        error_code=code,
-                        next_action=CRMContactWriteNextAction.RECONCILE_SAME_KEY,
-                    ),
+                    _unresolved_identity_result(lookup.decision, replayed=True),
                 )
             return await _complete_result(
                 session_factory,
@@ -647,11 +642,12 @@ async def _create_after_no_match(
                                 error_code=CRMContactWriteErrorCode.CONTACT_ALREADY_EXISTS,
                             )
                         else:
-                            result = _create_result(
-                                CRMContactCreateOutcome.IDENTITY_CONFLICT,
-                                error_code=CRMContactWriteErrorCode.IDENTITY_CONFLICT,
-                                next_action=CRMContactWriteNextAction.OPERATOR_REVIEW,
+                            result = _unresolved_identity_result(
+                                conflict_lookup.decision,
+                                replayed=snapshot.replayed,
                             )
+                            _store_uncertain(session, snapshot, execution, result)
+                            return result
                     _terminalize(session, snapshot, execution, result)
                     return result
                 result = _provider_error_result(error, uncertain=False, replayed=False)
@@ -969,6 +965,32 @@ def _provider_error_result(
             }
             else CRMContactWriteNextAction.RETRY_SAME_KEY
         ),
+    )
+
+
+def _unresolved_identity_result(
+    decision: CRMContactIdentityDecision,
+    *,
+    replayed: bool,
+) -> CRMContactCreateResult:
+    """Keep an earlier possible create durable while identity remains unresolved."""
+    if decision.outcome is CRMContactIdentityOutcome.NOT_FOUND:
+        error_code = CRMContactWriteErrorCode.PROVIDER_UNAVAILABLE
+        next_action = CRMContactWriteNextAction.RECONCILE_SAME_KEY
+    elif decision.outcome is CRMContactIdentityOutcome.AMBIGUOUS:
+        error_code = CRMContactWriteErrorCode.AMBIGUOUS_IDENTITY
+        next_action = CRMContactWriteNextAction.RECONCILE_SAME_KEY
+    elif decision.outcome is CRMContactIdentityOutcome.IDENTITY_CONFLICT:
+        error_code = CRMContactWriteErrorCode.IDENTITY_CONFLICT
+        next_action = CRMContactWriteNextAction.OPERATOR_REVIEW
+    else:
+        error_code = CRMContactWriteErrorCode.INVALID_PROVIDER_RESPONSE
+        next_action = CRMContactWriteNextAction.OPERATOR_REVIEW
+    return _create_result(
+        CRMContactCreateOutcome.UNCERTAIN,
+        replayed=replayed,
+        error_code=error_code,
+        next_action=next_action,
     )
 
 
