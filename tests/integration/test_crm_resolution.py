@@ -188,7 +188,7 @@ def _request(
     return CRMContactResolutionRequest(
         conversation_id=conversation_id,
         contact_id=contact_id,
-        idempotency_key=key or f"resolve-{uuid.uuid4().hex}",
+        idempotency_key=key or str(uuid.uuid4()),
         trusted_verified_email=email,
     )
 
@@ -644,7 +644,7 @@ async def test_same_key_replay_reverifies_mapping_with_fresh_provider_read(sessi
     provider.search_body = _search(candidate)
     provider.contact_by_email[email] = (200, candidate)
     provider.contact_by_id[_provider_id("720")] = (200, candidate)
-    request = _request(contact_id, conversation_id, email=email, key=f"replay-{uuid.uuid4().hex}")
+    request = _request(contact_id, conversation_id, email=email, key=str(uuid.uuid4()))
 
     first = await _resolve(session_factory, request, provider)
     second = await _resolve(session_factory, request, provider)
@@ -662,7 +662,7 @@ async def test_same_key_replay_reverifies_mapping_with_fresh_provider_read(sessi
 async def test_same_idempotency_key_cannot_be_reused_for_another_contact(session_factory) -> None:
     contact_id, conversation_id, phone = await _local_identity(session_factory)
     other_contact_id, other_conversation_id, _ = await _local_identity(session_factory)
-    key = f"shared-{uuid.uuid4().hex}"
+    key = str(uuid.uuid4())
     provider = MockHubSpot()
     provider.search_body = _search(_contact_payload(_provider_id("721"), phone=phone))
     first = await _resolve(
@@ -683,6 +683,135 @@ async def test_same_idempotency_key_cannot_be_reused_for_another_contact(session
     assert len(provider.requests) == previous_request_count
 
 
+async def test_same_key_rejects_different_trusted_emails_after_no_match(session_factory) -> None:
+    first_email = f"first-{uuid.uuid4().hex}@example.test"
+    second_email = f"second-{uuid.uuid4().hex}@example.test"
+    contact_id, conversation_id, _ = await _local_identity(session_factory, phone=None)
+    provider = MockHubSpot()
+    key = str(uuid.uuid4())
+
+    first = await _resolve(
+        session_factory,
+        _request(contact_id, conversation_id, email=first_email, key=key),
+        provider,
+    )
+    requests_after_first = len(provider.requests)
+    provider.contact_by_email[second_email] = (
+        200,
+        _contact_payload(_provider_id("724"), email=second_email),
+    )
+
+    second = await _resolve(
+        session_factory,
+        _request(contact_id, conversation_id, email=second_email, key=key),
+        provider,
+    )
+
+    assert first.outcome is CRMContactResolutionOutcome.NOT_FOUND
+    assert second.outcome is CRMContactResolutionOutcome.IDEMPOTENCY_CONFLICT
+    assert len(provider.requests) == requests_after_first
+    assert await _link(session_factory, contact_id) is None
+
+
+async def test_same_key_rejects_different_trusted_emails_after_provider_error(
+    session_factory,
+) -> None:
+    first_email = f"unavailable-{uuid.uuid4().hex}@example.test"
+    second_email = f"replacement-{uuid.uuid4().hex}@example.test"
+    contact_id, conversation_id, _ = await _local_identity(session_factory, phone=None)
+    provider = MockHubSpot()
+    provider.contact_by_email[first_email] = (503, {"message": "provider unavailable"})
+    key = str(uuid.uuid4())
+
+    first = await _resolve(
+        session_factory,
+        _request(contact_id, conversation_id, email=first_email, key=key),
+        provider,
+    )
+    requests_after_first = len(provider.requests)
+    provider.contact_by_email[second_email] = (
+        200,
+        _contact_payload(_provider_id("725"), email=second_email),
+    )
+
+    second = await _resolve(
+        session_factory,
+        _request(contact_id, conversation_id, email=second_email, key=key),
+        provider,
+    )
+
+    assert first.outcome is CRMContactResolutionOutcome.PROVIDER_UNAVAILABLE
+    assert second.outcome is CRMContactResolutionOutcome.IDEMPOTENCY_CONFLICT
+    assert len(provider.requests) == requests_after_first
+    assert await _link(session_factory, contact_id) is None
+
+
+async def test_same_key_accepts_email_case_and_outer_whitespace_normalization(
+    session_factory,
+) -> None:
+    email = f"normalized-{uuid.uuid4().hex}@example.test"
+    contact_id, conversation_id, _ = await _local_identity(session_factory, phone=None)
+    provider = MockHubSpot()
+    key = str(uuid.uuid4())
+    first = await _resolve(
+        session_factory,
+        _request(contact_id, conversation_id, email=f" {email.upper()} ", key=key),
+        provider,
+    )
+    provider_id = _provider_id("726")
+    provider.contact_by_email[email] = (200, _contact_payload(provider_id, email=email))
+
+    second = await _resolve(
+        session_factory,
+        _request(contact_id, conversation_id, email=email, key=key),
+        provider,
+    )
+
+    assert first.outcome is CRMContactResolutionOutcome.NOT_FOUND
+    assert second.outcome is CRMContactResolutionOutcome.FOUND_AND_LINKED
+    assert second.hubspot_contact_id == provider_id
+
+
+@pytest.mark.parametrize("first_has_email", [False, True])
+async def test_same_key_rejects_changed_trusted_email_presence(
+    session_factory,
+    first_has_email: bool,
+) -> None:
+    first_email = f"presence-{uuid.uuid4().hex}@example.test"
+    contact_id, conversation_id, _ = await _local_identity(session_factory)
+    provider = MockHubSpot()
+    key = str(uuid.uuid4())
+    first = await _resolve(
+        session_factory,
+        _request(
+            contact_id,
+            conversation_id,
+            email=first_email if first_has_email else None,
+            key=key,
+        ),
+        provider,
+    )
+    requests_after_first = len(provider.requests)
+
+    second = await _resolve(
+        session_factory,
+        _request(
+            contact_id,
+            conversation_id,
+            email=None if first_has_email else first_email,
+            key=key,
+        ),
+        provider,
+    )
+
+    assert first.outcome in {
+        CRMContactResolutionOutcome.NOT_FOUND,
+        CRMContactResolutionOutcome.UNRESOLVED_IDENTITY,
+    }
+    assert second.outcome is CRMContactResolutionOutcome.IDEMPOTENCY_CONFLICT
+    assert len(provider.requests) == requests_after_first
+
+
 async def test_pii_is_excluded_from_durable_execution_and_audit_json(session_factory) -> None:
     email = f"pii-sentinel-{uuid.uuid4().hex}@example.test"
     contact_id, conversation_id, phone = await _local_identity(session_factory)
@@ -690,7 +819,7 @@ async def test_pii_is_excluded_from_durable_execution_and_audit_json(session_fac
     candidate = _contact_payload(_provider_id("722"), email=email, phone=phone)
     provider.search_body = _search(candidate)
     provider.contact_by_email[email] = (200, candidate)
-    request = _request(contact_id, conversation_id, email=email, key=phone.removeprefix("+"))
+    request = _request(contact_id, conversation_id, email=email, key=str(uuid.uuid4()))
 
     result = await _resolve(session_factory, request, provider)
 
@@ -722,6 +851,7 @@ async def test_pii_is_excluded_from_durable_execution_and_audit_json(session_fac
     assert email not in persisted
     assert phone not in persisted
     assert phone.removeprefix("+") not in persisted
+    assert request.idempotency_key not in persisted
     assert AUTH_SENTINEL not in persisted
     assert result.next_action is CRMResolutionNextAction.NONE
 

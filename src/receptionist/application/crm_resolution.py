@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -49,7 +50,6 @@ from receptionist.integrations.hubspot import (
 
 _OPERATION: Literal["resolve_crm_contact"] = "resolve_crm_contact"
 _EMAIL_LIMIT = 254
-_IDEMPOTENCY_PATTERN = r"^[A-Za-z0-9_-]{1,128}$"
 
 
 class CRMContactResolutionOutcome(StrEnum):
@@ -97,15 +97,26 @@ class _CRMModel(BaseModel):
 class CRMContactResolutionRequest(_CRMModel):
     conversation_id: UUID
     contact_id: UUID
-    idempotency_key: str = Field(min_length=1, max_length=128, pattern=_IDEMPOTENCY_PATTERN)
+    idempotency_key: str = Field(min_length=36, max_length=36)
     trusted_verified_email: str | None = Field(default=None, max_length=_EMAIL_LIMIT)
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_canonical_uuid4_idempotency_key(cls, value: str) -> str:
+        try:
+            parsed = UUID(value)
+        except ValueError:
+            raise ValueError("idempotency key must be a canonical UUIDv4") from None
+        if str(parsed) != value or parsed.version != 4:
+            raise ValueError("idempotency key must be a canonical UUIDv4")
+        return value
 
     @field_validator("trusted_verified_email")
     @classmethod
     def validate_trusted_verified_email(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        normalized = value.strip()
+        normalized = value.strip().casefold()
         if (
             not normalized
             or len(normalized) > _EMAIL_LIMIT
@@ -178,7 +189,22 @@ async def resolve_crm_contact(
 ) -> CRMContactResolutionResult:
     """Resolve one owned local Contact through a same-key account-preflighted client."""
     try:
-        loaded = await _load_local_state(session_factory, request)
+        trusted_email_tag = _trusted_email_hmac_tag(
+            request.idempotency_key,
+            request.trusted_verified_email,
+        )
+    except (UnicodeEncodeError, ValueError):
+        return _result(
+            CRMContactResolutionOutcome.INVALID_REQUEST,
+            error_code=CRMResolutionErrorCode.INVALID_REQUEST,
+            next_action=CRMResolutionNextAction.OPERATOR_REVIEW,
+        )
+    try:
+        loaded = await _load_local_state(
+            session_factory,
+            request,
+            trusted_email_tag=trusted_email_tag,
+        )
     except SQLAlchemyError:
         return _result(
             CRMContactResolutionOutcome.PROVIDER_UNAVAILABLE,
@@ -437,7 +463,10 @@ async def resolve_crm_contact(
 
 
 async def _load_local_state(
-    session_factory: async_sessionmaker[AsyncSession], request: CRMContactResolutionRequest
+    session_factory: async_sessionmaker[AsyncSession],
+    request: CRMContactResolutionRequest,
+    *,
+    trusted_email_tag: str | None,
 ) -> _ResolutionSnapshot | CRMContactResolutionResult:
     async with session_factory.begin() as session:
         conversation = await session.get(Conversation, request.conversation_id)
@@ -454,6 +483,7 @@ async def _load_local_state(
             "conversation_id": str(request.conversation_id),
             "contact_id": str(request.contact_id),
             "trusted_email_supplied": request.trusted_verified_email is not None,
+            "trusted_email_identity_tag": trusted_email_tag,
         }
         claim = await _claim_tool_execution(
             session,
@@ -1161,6 +1191,20 @@ def _settings_configured(settings: Settings) -> bool:
 def _durable_idempotency_key(value: str) -> str:
     """Keep caller-supplied key material out of durable ToolExecution rows."""
     return hashlib.sha256(value.encode("ascii")).hexdigest()
+
+
+def _trusted_email_hmac_tag(idempotency_key: str, trusted_email: str | None) -> str | None:
+    """Bind normalized trusted email evidence without persisting its value."""
+    if trusted_email is None:
+        return None
+    normalized = _normalized_email(trusted_email)
+    if not isinstance(normalized, str):
+        raise ValueError("trusted verified email is invalid")
+    return hmac.new(
+        idempotency_key.encode("ascii"),
+        normalized.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _settings_unchanged(
