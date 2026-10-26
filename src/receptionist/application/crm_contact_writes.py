@@ -7,6 +7,9 @@ confirmation mechanism and is not exposed as an HTTP or LLM tool.
 
 A later provider-write implementation must preserve HubSpotClient's existing
 account and capability activation guard; this contract adds no test bypass.
+Caught Pydantic validation errors must be translated with the safe result helper
+before crossing a logging, public, or durable boundary; their structured forms
+may contain the original input.
 """
 
 from __future__ import annotations
@@ -15,7 +18,14 @@ from enum import StrEnum
 from typing import ClassVar, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -24,6 +34,7 @@ from receptionist.db.models import Contact, Conversation
 from receptionist.domain.identity import PhoneNormalizationError, normalize_phone_number
 
 _EMAIL_LIMIT = 254
+CRMContactWriteOperation = Literal["create_crm_contact", "update_crm_contact"]
 
 
 class _ContactWriteModel(BaseModel):
@@ -38,8 +49,14 @@ class _ContactWriteRequest(_ContactWriteModel):
         default=None,
         max_length=_EMAIL_LIMIT,
         repr=False,
+        exclude=True,
     )
-    trusted_verified_phone: str | None = Field(default=None, max_length=32, repr=False)
+    trusted_verified_phone: str | None = Field(
+        default=None,
+        max_length=32,
+        repr=False,
+        exclude=True,
+    )
 
     @field_validator("idempotency_key")
     @classmethod
@@ -87,7 +104,7 @@ class CRMContactCreateRequest(_ContactWriteRequest):
     """Shape-checked internal create input; it does not prove trusted provenance."""
 
     operation: ClassVar[Literal["create_crm_contact"]] = "create_crm_contact"
-    trusted_verified_email: str = Field(max_length=_EMAIL_LIMIT, repr=False)
+    trusted_verified_email: str = Field(max_length=_EMAIL_LIMIT, repr=False, exclude=True)
 
 
 class CRMContactUpdateRequest(_ContactWriteRequest):
@@ -177,7 +194,7 @@ class CRMContactUpdateResult(_ContactWriteModel):
 class CRMContactWriteValidationResult(_ContactWriteModel):
     """Safe validation result; ``valid`` does not authorize a provider mutation."""
 
-    operation: Literal["create_crm_contact", "update_crm_contact"]
+    operation: CRMContactWriteOperation
     outcome: CRMContactWriteValidationOutcome
     replayed: bool = False
     error_code: CRMContactWriteErrorCode | None = None
@@ -185,6 +202,20 @@ class CRMContactWriteValidationResult(_ContactWriteModel):
 
 
 CRMContactWriteRequest = CRMContactCreateRequest | CRMContactUpdateRequest
+
+
+def _safe_validation_error_result(
+    operation: CRMContactWriteOperation,
+    error: ValidationError,
+) -> CRMContactWriteValidationResult:
+    """Translate a Pydantic failure without inspecting its potentially sensitive data."""
+    del error
+    return CRMContactWriteValidationResult(
+        operation=operation,
+        outcome=CRMContactWriteValidationOutcome.INVALID_REQUEST,
+        error_code=CRMContactWriteErrorCode.INVALID_REQUEST,
+        next_action=CRMContactWriteNextAction.OPERATOR_REVIEW,
+    )
 
 
 async def validate_crm_contact_write(

@@ -12,6 +12,7 @@ from receptionist.application.crm_contact_writes import (
     CRMContactUpdateOutcome,
     CRMContactUpdateRequest,
     CRMContactUpdateResult,
+    _safe_validation_error_result,
 )
 
 pytestmark = pytest.mark.unit
@@ -143,17 +144,80 @@ def test_write_requests_require_canonical_uuid4_keys() -> None:
             )
 
 
-def test_write_request_repr_hides_email_and_phone() -> None:
-    email = "write-contract-private@example.test"
+def test_create_request_repr_and_default_serialization_hide_pii() -> None:
+    email = "create-private-sentinel@example.test"
     phone = "+966501234567"
     request = CRMContactCreateRequest(
         **_ids(),
-        trusted_verified_email=email,
+        trusted_verified_email=f" {email.upper()} ",
         trusted_verified_phone=phone,
     )
 
+    assert request.trusted_verified_email == email
+    assert request.trusted_verified_phone == phone
     assert email not in repr(request)
     assert phone not in repr(request)
+    assert email not in str(request.model_dump())
+    assert phone not in str(request.model_dump())
+    assert email not in request.model_dump_json()
+    assert phone not in request.model_dump_json()
+
+
+def test_update_request_default_serialization_hides_selected_pii() -> None:
+    email = "update-private-sentinel@example.test"
+    phone = "+966551234567"
+    request = CRMContactUpdateRequest(
+        **_ids(),
+        trusted_verified_email=f" {email.upper()} ",
+        trusted_verified_phone=phone,
+    )
+
+    assert request.trusted_verified_email == email
+    assert request.trusted_verified_phone == phone
+    assert email not in repr(request)
+    assert phone not in repr(request)
+    assert email not in str(request.model_dump())
+    assert phone not in str(request.model_dump())
+    assert email not in request.model_dump_json()
+    assert phone not in request.model_dump_json()
+
+
+def test_safe_validation_error_result_discards_raw_pydantic_payload() -> None:
+    email = "invalid-email-private-sentinel"
+    nested_value = "nested-properties-private-sentinel"
+    with pytest.raises(ValidationError) as raised:
+        CRMContactCreateRequest(
+            **_ids(),
+            trusted_verified_email=email,
+            properties={"customer": nested_value},
+        )
+
+    raw_error = raised.value
+    raw_structured = f"{raw_error.errors()} {raw_error.json()}"
+    assert email in raw_structured
+    assert nested_value in raw_structured
+
+    safe_result = _safe_validation_error_result("create_crm_contact", raw_error)
+    safe_output = f"{safe_result.model_dump(mode='json')} {safe_result.model_dump_json()}"
+    assert safe_result.operation == "create_crm_contact"
+    assert safe_result.outcome.value == "invalid_request"
+    assert safe_result.error_code is not None
+    assert safe_result.next_action.value == "operator_review"
+    assert email not in safe_output
+    assert nested_value not in safe_output
+    assert "authorized" not in safe_output
+    assert "write_enabled" not in safe_output
+
+
+def test_safe_validation_error_result_preserves_update_operation() -> None:
+    with pytest.raises(ValidationError) as raised:
+        CRMContactUpdateRequest(**_ids())
+
+    safe_result = _safe_validation_error_result("update_crm_contact", raised.value)
+
+    assert safe_result.operation == "update_crm_contact"
+    assert safe_result.outcome.value == "invalid_request"
+    assert "authorized" not in safe_result.model_dump(mode="json")
 
 
 def test_write_results_serialize_only_finite_safe_fields() -> None:
