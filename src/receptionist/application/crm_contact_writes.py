@@ -122,12 +122,15 @@ class CRMContactUpdateRequest(_ContactWriteRequest):
 class CRMContactCreateOutcome(StrEnum):
     CREATED = "created"
     REPLAYED = "replayed"
+    EXISTING_CONTACT = "existing_contact"
     IDENTITY_CONFLICT = "identity_conflict"
     UNCERTAIN = "uncertain"
     FAILED = "failed"
     NOT_CONFIGURED = "not_configured"
     INVALID_REQUEST = "invalid_request"
     OWNERSHIP_REJECTED = "ownership_rejected"
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+    OPERATION_IN_PROGRESS = "operation_in_progress"
 
 
 class CRMContactUpdateOutcome(StrEnum):
@@ -145,6 +148,19 @@ class CRMContactWriteErrorCode(StrEnum):
     INVALID_REQUEST = "invalid_request"
     OWNERSHIP_MISMATCH = "ownership_mismatch"
     IDENTITY_CONFLICT = "identity_conflict"
+    AMBIGUOUS_IDENTITY = "ambiguous_identity"
+    CONTACT_ALREADY_EXISTS = "contact_already_exists"
+    NOT_CONFIGURED = "not_configured"
+    ACCOUNT_MISMATCH = "account_mismatch"
+    ACTIVATION_REQUIRED = "activation_required"
+    PERMISSION_DENIED = "permission_denied"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    INVALID_PROVIDER_RESPONSE = "invalid_provider_response"
+    PROVIDER_VALIDATION = "provider_validation"
+    RATE_LIMITED = "rate_limited"
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+    OPERATION_IN_PROGRESS = "operation_in_progress"
+    LOCAL_STATE_CHANGED = "local_state_changed"
     LOCAL_PERSISTENCE_FAILURE = "local_persistence_failure"
 
 
@@ -255,7 +271,7 @@ async def validate_crm_contact_write(
             error_code=CRMContactWriteErrorCode.OWNERSHIP_MISMATCH,
             next_action=CRMContactWriteNextAction.OPERATOR_REVIEW,
         )
-    if _identity_conflicts(contact, request):
+    if contact_identity_conflicts(contact, request):
         return _validation_result(
             request,
             CRMContactWriteValidationOutcome.IDENTITY_CONFLICT,
@@ -280,7 +296,7 @@ def _validation_result(
     )
 
 
-def _identity_conflicts(contact: Contact, request: CRMContactWriteRequest) -> bool:
+def contact_identity_conflicts(contact: Contact, request: CRMContactWriteRequest) -> bool:
     trusted_email = request.trusted_verified_email
     if trusted_email is not None and contact.email is not None and contact.email.strip():
         stored_email = _normalize_email(contact.email)
