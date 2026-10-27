@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
@@ -32,6 +33,13 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_NOTE_BODY_CHARS = 4000
 MAX_RETRY_AFTER_SECONDS = 300
 NOTE_TO_CONTACT_ASSOCIATION_TYPE_ID = 202
+HUBSPOT_SMOKE_CAPABILITY_CONFIRMATION = (
+    "I_VERIFIED_HUBSPOT_DEVELOPER_CONTACT_READ_WRITE_AND_ACCOUNT_PREFLIGHT"
+)
+_SMOKE_CONTACT_EMAIL_PATTERN = re.compile(
+    r"^hubspot-smoke\+[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}@example\.com$"
+)
 
 
 class HubSpotErrorCode(StrEnum):
@@ -178,6 +186,10 @@ class HubSpotClient:
         self._timeout_seconds = settings.hubspot_request_timeout_seconds
         self._mock_transport = isinstance(transport, httpx.MockTransport)
         self._preflight_result: HubSpotPreflightResult | None = None
+        self._smoke_contact_email: str | None = None
+        self._smoke_contact_id: str | None = None
+        self._smoke_writes_enabled = False
+        self._smoke_contact_create_used = False
         self._client = httpx.AsyncClient(
             base_url=API_ORIGIN,
             timeout=httpx.Timeout(self._timeout_seconds),
@@ -290,7 +302,17 @@ class HubSpotClient:
     async def create_contact(
         self, *, email: str, phone: str | None = None
     ) -> HubSpotContactSnapshot:
-        self._assert_write_activation()
+        if self._smoke_writes_enabled:
+            if (
+                phone is not None
+                or email != self._smoke_contact_email
+                or self._smoke_contact_create_used
+            ):
+                raise HubSpotProviderError(HubSpotErrorCode.ACTIVATION_REQUIRED)
+            self._assert_write_activation(smoke_contact_email=email)
+            self._smoke_contact_create_used = True
+        else:
+            self._assert_write_activation()
         properties: dict[str, str] = {"email": _nonblank_text(email, max_length=254)}
         if phone is not None:
             properties["phone"] = _nonblank_text(phone, max_length=64)
@@ -500,6 +522,58 @@ class HubSpotClient:
             raise HubSpotProviderError(HubSpotErrorCode.CONFLICT, outcome_uncertain=True)
         return repaired
 
+    async def verify_smoke_contact(
+        self, contact_id: str, *, expected_email: str
+    ) -> HubSpotContactSnapshot:
+        """Bind cleanup to a fresh read of this run's exact synthetic Contact."""
+        self._assert_write_activation(smoke_contact_email=expected_email)
+        record_id = _record_id(contact_id)
+        if not _is_smoke_contact_email(expected_email):
+            raise HubSpotProviderError(HubSpotErrorCode.INVALID_REQUEST)
+        current = await self.get_contact_by_id(record_id)
+        if current.id != record_id or current.email != expected_email or current.archived:
+            raise HubSpotProviderError(HubSpotErrorCode.CONFLICT)
+        self._smoke_contact_id = record_id
+        return current
+
+    async def archive_smoke_contact(self, contact_id: str, *, expected_email: str) -> None:
+        """Archive only the active synthetic Contact created by the current smoke run."""
+        self._assert_write_activation(smoke_contact_email=expected_email)
+        record_id = _record_id(contact_id)
+        if not _is_smoke_contact_email(expected_email) or self._smoke_contact_id != record_id:
+            raise HubSpotProviderError(HubSpotErrorCode.INVALID_REQUEST)
+        current = await self.get_contact_by_id(record_id)
+        if current.id != record_id or current.email != expected_email:
+            raise HubSpotProviderError(HubSpotErrorCode.CONFLICT)
+        if current.archived:
+            return
+        await self._request_empty(
+            "DELETE", f"/crm/objects/2026-09/contacts/{record_id}", write=True
+        )
+
+    def _activate_guarded_smoke_writes(
+        self,
+        *,
+        portal_id: str,
+        capability_confirmation: str,
+        contact_email: str,
+    ) -> None:
+        """Enable one reviewed local smoke Contact after same-key identity preflight."""
+        preflight = self._preflight_result
+        if (
+            self._settings.app_env != "local"
+            or not self._configuration_is_current()
+            or portal_id != self._expected_portal_id
+            or capability_confirmation != HUBSPOT_SMOKE_CAPABILITY_CONFIRMATION
+            or preflight is None
+            or preflight.outcome is not HubSpotPreflightOutcome.VERIFIED
+            or not preflight.account_identity_verified
+            or not _is_smoke_contact_email(contact_email)
+        ):
+            raise HubSpotProviderError(HubSpotErrorCode.ACTIVATION_REQUIRED)
+        self._smoke_contact_email = contact_email
+        self._smoke_writes_enabled = True
+
     def _configuration_is_current(self) -> bool:
         """Reject settings mutation so preflight evidence stays bound to its config."""
         return (
@@ -509,8 +583,16 @@ class HubSpotClient:
             and _valid_portal_id(self._settings.hubspot_portal_id)
         )
 
-    def _assert_write_activation(self) -> None:
+    def _assert_write_activation(self, *, smoke_contact_email: str | None = None) -> None:
         """Allow only isolated preflight-free test mocks; production stays fail-closed."""
+        if self._smoke_writes_enabled:
+            if (
+                self._settings.app_env == "local"
+                and self._configuration_is_current()
+                and smoke_contact_email == self._smoke_contact_email
+            ):
+                return
+            raise HubSpotProviderError(HubSpotErrorCode.ACTIVATION_REQUIRED)
         isolated_test_transport = self._settings.app_env in {"test", "ci"} and self._mock_transport
         if (
             isolated_test_transport
@@ -932,6 +1014,10 @@ def _settings_are_configured(settings: Settings) -> bool:
 
 def _valid_portal_id(value: str | None) -> bool:
     return isinstance(value, str) and value.isascii() and value.isdecimal() and int(value) > 0
+
+
+def _is_smoke_contact_email(value: str) -> bool:
+    return _SMOKE_CONTACT_EMAIL_PATTERN.fullmatch(value) is not None
 
 
 def _preflight_result(

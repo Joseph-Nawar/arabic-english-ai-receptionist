@@ -5,7 +5,8 @@ TEST_DATABASE_URL ?= postgresql+psycopg://receptionist:receptionist@localhost:55
 .PHONY: install dev db-up db-down test-db-up test-db-down migrate migration \
 	migration-check seed test test-unit \
 	test-integration lint format format-check typecheck secrets audit security \
-	alembic-verify docker-config docker-build calendar-smoke check verify
+	alembic-verify docker-config docker-build calendar-smoke hubspot-smoke-db-up \
+	hubspot-smoke-db-down hubspot-smoke check verify
 
 install:
 	$(UV) sync --all-groups --frozen
@@ -79,6 +80,16 @@ security: lint secrets audit
 
 calendar-smoke:
 	$(UV) run python scripts/calendar_smoke.py
+
+hubspot-smoke-db-up:
+	docker compose --profile hubspot-smoke up -d hubspot-smoke-db
+
+hubspot-smoke-db-down:
+	docker compose --profile hubspot-smoke stop hubspot-smoke-db
+	docker compose --profile hubspot-smoke rm -f hubspot-smoke-db
+
+hubspot-smoke:
+	$(UV) run python scripts/hubspot_smoke.py
 
 docker-config:
 	docker compose config

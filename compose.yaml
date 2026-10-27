@@ -30,5 +30,22 @@ services:
       timeout: 5s
       retries: 10
 
+  hubspot-smoke-db:
+    profiles: ["hubspot-smoke"]
+    image: postgres:18.6-bookworm
+    environment:
+      POSTGRES_DB: receptionist_hubspot_smoke
+      POSTGRES_USER: hubspot_smoke
+      POSTGRES_PASSWORD: local_smoke_only
+    ports:
+      - "127.0.0.1:55433:5432"
+    tmpfs:
+      - /var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hubspot_smoke -d receptionist_hubspot_smoke"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
 volumes:
   receptionist_postgres_data:
