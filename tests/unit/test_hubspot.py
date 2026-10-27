@@ -230,7 +230,7 @@ async def test_note_create_uses_bounded_body_and_exact_contact_association() -> 
     assert requests[0].url.path == "/crm/objects/2026-09/notes"
     assert json.loads(requests[0].content) == {
         "properties": {
-            "hs_timestamp": "2026-10-25T10:30:00.000Z",
+            "hs_timestamp": "2026-10-25T10:30:00.000000Z",
             "hs_note_body": "Booking confirmed. source-op:abc123",
         },
         "associations": [
@@ -240,6 +240,35 @@ async def test_note_create_uses_bounded_body_and_exact_contact_association() -> 
             }
         ],
     }
+
+
+@pytest.mark.asyncio
+async def test_note_create_preserves_historical_timestamp_microseconds() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return json_response(
+            {
+                "id": "654321",
+                "properties": {
+                    "hs_note_body": "source marker",
+                    "hs_timestamp": "2026-10-25T10:30:00.123456Z",
+                },
+                "associations": {"contacts": {"results": [{"id": "987654"}]}},
+            }
+        )
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        await client.create_note(
+            "987654",
+            body="source marker",
+            timestamp=datetime(2026, 10, 25, 10, 30, 0, 123456, tzinfo=UTC),
+        )
+
+    assert json.loads(requests[0].content)["properties"]["hs_timestamp"] == (
+        "2026-10-25T10:30:00.123456Z"
+    )
 
 
 @pytest.mark.asyncio

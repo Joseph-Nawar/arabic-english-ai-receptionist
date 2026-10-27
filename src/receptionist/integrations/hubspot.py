@@ -351,7 +351,7 @@ class HubSpotClient:
         ):
             raise HubSpotProviderError(HubSpotErrorCode.INVALID_REQUEST)
         timestamp_value = (
-            timestamp.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            timestamp.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
         )
         try:
             payload = await self._request_json(
