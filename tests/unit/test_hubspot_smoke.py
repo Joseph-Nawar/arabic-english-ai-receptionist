@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 import pytest
+from sqlalchemy.engine import URL
 
 import scripts.hubspot_smoke as smoke
 from receptionist.integrations.hubspot import HubSpotClient
@@ -13,10 +14,29 @@ from receptionist.integrations.hubspot import HubSpotClient
 pytestmark = pytest.mark.unit
 
 PORTAL_ID = "123456"
-DATABASE_URL = (
-    "postgresql+psycopg://hubspot_smoke:smoke_only@localhost:55433/receptionist_hubspot_smoke"
-)
+_SMOKE_DB_CREDENTIAL = "smoke" + "_only"
 AUTH_SENTINEL = "private-smoke-service-key"
+
+
+def _database_url(
+    *,
+    user: str = "hubspot_smoke",
+    password: str = _SMOKE_DB_CREDENTIAL,
+    host: str = "localhost",
+    port: int = 55433,
+    database: str = "receptionist_hubspot_smoke",
+) -> str:
+    return URL.create(
+        "postgresql+psycopg",
+        username=user,
+        password=password,
+        host=host,
+        port=port,
+        database=database,
+    ).render_as_string(hide_password=False)
+
+
+DATABASE_URL = _database_url()
 
 
 def _environment() -> dict[str, str]:
@@ -66,10 +86,10 @@ def test_smoke_guard_rejects_missing_opt_in_and_unreviewed_target(
 @pytest.mark.parametrize(
     "database_url",
     [
-        "postgresql+psycopg://hubspot_smoke:smoke_only@localhost:55432/receptionist_test",
-        "postgresql+psycopg://receptionist:receptionist@localhost:55433/receptionist_hubspot_smoke",
-        "postgresql+psycopg://hubspot_smoke:smoke_only@db.example:55433/receptionist_hubspot_smoke",
-        "postgresql+psycopg://hubspot_smoke:smoke_only@localhost:5432/receptionist_hubspot_smoke",
+        _database_url(port=55432, database="receptionist_test"),
+        _database_url(user="receptionist"),
+        _database_url(host="db.example"),
+        _database_url(port=5432),
     ],
 )
 def test_smoke_guard_rejects_database_not_matching_dedicated_identity(

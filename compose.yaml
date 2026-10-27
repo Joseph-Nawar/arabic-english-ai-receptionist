@@ -36,7 +36,7 @@ services:
     environment:
       POSTGRES_DB: receptionist_hubspot_smoke
       POSTGRES_USER: hubspot_smoke
-      POSTGRES_PASSWORD: local_smoke_only
+      POSTGRES_PASSWORD: ${HUBSPOT_SMOKE_POSTGRES_PASSWORD:-hubspot_smoke}
     ports:
       - "127.0.0.1:55433:5432"
     tmpfs:
