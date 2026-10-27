@@ -2,17 +2,17 @@
 
 ## Boundaries
 
-Unit tests live in `tests/unit`. They do not require Docker, PostgreSQL, network access, or external providers. They cover settings isolation/secret safety, app construction, and liveness. The shared pytest configuration blocks `httplib2` network transport, so an accidental live Google Calendar request fails immediately.
+Unit tests live in `tests/unit`. They do not require Docker, PostgreSQL, network access, or external providers. They cover settings isolation/secret safety, app construction, and liveness. The shared pytest configuration blocks `httplib2` and `httpx` socket transports, while `HubSpotClient` also rejects non-mock transports in `test` and `ci` environments.
 
-Integration tests live in `tests/integration` and use real PostgreSQL. They cover SQLAlchemy/Psycopg connectivity and disposal, Alembic upgrade → downgrade → upgrade, and readiness behavior. The normal CI job provides PostgreSQL as a service and does not call external SaaS providers.
+Integration tests live in `tests/integration` and use real PostgreSQL. They cover Phase 2 booking transactions, M3B/M3C Contact identity and mutations, M3D historical Note claims and recovery, concurrency, migration cycles, connectivity, and readiness. Provider calls use deterministic doubles or mocked HTTP transports. The normal CI job provides PostgreSQL as a service and does not call external SaaS providers.
 
 All normal automated verification is provider-free: `make test`, `make test-unit`,
 `make test-integration`, `make check`, `make verify`, and GitHub CI do not require
-Calendar credentials and do not make live Google Calendar, CRM, messaging, voice,
-LLM, or other SaaS calls. Booking integration tests inject the deterministic
-Calendar double; Google request translation is tested with mocked service and
-transport objects. Live Google verification is a separate guarded Task 16 smoke
-operation and is not part of these commands.
+Calendar or HubSpot credentials and do not make live Google Calendar, CRM,
+messaging, voice, LLM, or other SaaS calls. Booking integration tests inject the
+deterministic Calendar double; CRM integration tests use `httpx.MockTransport`
+with real isolated PostgreSQL. Live Google and HubSpot verification are separate
+guarded manual smoke operations and are not part of these commands.
 
 ## Test database and destruction guard
 
@@ -63,6 +63,8 @@ Phase 2 automated tests remain provider-free. The deterministic Calendar double 
 `make migration-check` and `make alembic-verify` cover migration drift and the guarded upgrade → downgrade → upgrade cycle. Repeated integration runs use the guarded `receptionist_test` database and isolate their own state without a blanket schema-reset fixture. The non-mutating `make secrets` target scans tracked and untracked non-ignored files against a temporary baseline copy; it must not modify `.secrets.baseline`.
 
 The separate `make calendar-smoke` command is a manual, explicitly guarded check against a dedicated non-production secondary Calendar only. It requires the provider-assigned secondary ID ending in `@group.calendar.google.com`, the exact smoke confirmation marker, `RECEPTIONIST_CALENDAR_SMOKE_ENV=synthetic`, `RECEPTIONIST_APP_ENV=test`, and the guarded `receptionist_test` database. It proves the real free/busy, create, same-key replay/recovery, retrieval, reschedule, cancellation, reconciliation, and exact cleanup path. It is never part of CI, `make test`, `make check`, or `make verify`. If dedicated credentials are unavailable, report exactly `not run: dedicated Calendar credentials unavailable`; do not claim a live pass.
+
+The separate `make hubspot-smoke` workflow uses the dedicated `hubspot-smoke` Compose profile and a strict smoke database guard. It is never part of CI or normal test/check targets. Its prerequisites, exact operator markers, reviewed-portal allowlist, and cleanup boundary are in the [HubSpot integration guide](../integrations/hubspot.md). The current repository allowlist is empty and no live HubSpot smoke has been run.
 
 The destructive migration cycle remains protected by `assert_safe_test_database`; it refuses non-test environments and any database name other than `receptionist_test`. The seed command is a thin invocation of the synthetic reference seed and has its own production refusal.
 

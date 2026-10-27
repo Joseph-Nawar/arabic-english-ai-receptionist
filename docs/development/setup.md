@@ -59,6 +59,8 @@ Runtime Google Calendar settings are optional for ordinary startup and provider-
 
 There is no application OAuth consent UI, browser flow, credential bootstrap, or credential file persistence. Keep all credential values out of `.env.example`, Git, logs, and exceptions.
 
+HubSpot is optional. Its account-level Service Key and expected portal ID are provisioned out of band; see the [HubSpot integration guide](../integrations/hubspot.md) for account binding, capability restrictions, and the separate manual smoke workflow. Do not place a real Service Key in `.env.example` or commit it.
+
 ## Optional dedicated Calendar smoke
 
 Phase 2 includes a manual-only Calendar smoke path for a dedicated non-production Calendar. It is never part of application startup, normal tests, `make check`, `make verify`, or CI. Provision an OAuth authorized-user refresh token out of band with exactly these least-privilege scopes:

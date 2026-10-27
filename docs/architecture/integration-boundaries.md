@@ -1,6 +1,6 @@
 # Integration boundaries
 
-This document records the implemented Phase 2 Calendar boundary and the future ownership boundaries. The project remains a modular monolith with one concrete external integration: one configured writable Google Calendar.
+This document records the implemented Phase 2 Calendar and Phase 3 HubSpot boundaries. The project remains a modular monolith with a concrete boundary for one configured writable Google Calendar and one HubSpot account integration whose production writes remain fail-closed pending capability verification.
 
 ## Boundary rules
 
@@ -32,7 +32,7 @@ Own provider authentication, availability reads, event creation/update/cancellat
 
 ### CRM
 
-Own contact/company lookup and synchronization with the selected CRM. HubSpot owns CRM customer, lead, and opportunity lifecycle state. The application owns local identity mapping, contact identity as used by this application, conversation linkage, customer-operation decisions, and the audit of what was requested or changed.
+The concrete HubSpot client owns Service Key transmission, account preflight, bounded Contact/Note requests, response parsing, and safe provider errors. The application owns Contact matching rules, portal-scoped Contact links, trusted field selection, durable mutation claims, explicit Note creation, and same-key recovery. A Contact write can only set the approved identity fields through an internal trusted boundary; updates fill blank fields and do not overwrite conflicting values. Booking Notes use validated historical ToolExecutions and do not read mutable Booking state. Google Calendar remains authoritative for appointments, and a CRM failure cannot change a committed booking. See the [HubSpot integration guide](../integrations/hubspot.md) for exact behavior and activation limitations.
 
 ### Messaging
 
