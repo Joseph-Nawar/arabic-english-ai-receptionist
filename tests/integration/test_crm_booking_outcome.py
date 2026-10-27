@@ -110,12 +110,32 @@ class MockHubSpot:
         self.note_timestamp_override: str | None = None
         self.omit_note_response_properties = False
         self.note_exception: BaseException | None = None
+        self.save_note_before_exception = False
         self.before_note_response: Callable[[], Awaitable[None]] | None = None
+        self.search_status = 200
+        self.search_exception: BaseException | None = None
+        self.search_response: object | None = None
+        self.search_incomplete = False
+        self.search_visible_after = 0
+        self.search_count = 0
+        self.before_note_search: Callable[[], Awaitable[None]] | None = None
+        self.note_read_status = 200
+        self.note_read_fail_on_count: int | None = None
+        self.note_read_exception: BaseException | None = None
+        self.note_read_override: dict[str, object] | None = None
+        self.association_put_status = 204
+        self.association_put_exception: BaseException | None = None
+        self.association_put_after_mutation = False
+        self.before_association_put: Callable[[], Awaitable[None]] | None = None
         self.requests: list[httpx.Request] = []
         self.note_payloads: list[dict[str, object]] = []
         self.note_create_count = 0
+        self.note_search_count = 0
+        self.note_read_count = 0
+        self.association_put_count = 0
         self.note_id = str(800_000_000 + uuid.uuid4().int % 99_000_000)
         self.saved_note: dict[str, object] | None = None
+        self.saved_notes: dict[str, dict[str, object]] = {}
 
     async def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -136,6 +156,34 @@ class MockHubSpot:
                 json={"total": 1, "results": [self.search_contact_body or self.contact_body]},
             )
 
+        if request.method == "POST" and request.url.path == "/crm/objects/2026-09/notes/search":
+            self.note_search_count += 1
+            if self.before_note_search is not None:
+                await self.before_note_search()
+            if self.search_exception is not None:
+                raise self.search_exception
+            if self.search_response is not None:
+                return httpx.Response(self.search_status, json=self.search_response)
+            query = json.loads(request.content).get("query")
+            visible = self.note_search_count > self.search_visible_after
+            rows = []
+            if visible and isinstance(query, str):
+                for note in self.saved_notes.values():
+                    properties = note.get("properties")
+                    body = properties.get("hs_note_body") if isinstance(properties, dict) else None
+                    if isinstance(body, str) and query in body:
+                        rows.append(
+                            {
+                                "id": note["id"],
+                                "properties": properties,
+                                "archived": note.get("archived", False),
+                            }
+                        )
+            response_body: dict[str, object] = {"total": len(rows), "results": rows[:5]}
+            if self.search_incomplete:
+                response_body["paging"] = {"next": {"after": "100"}}
+            return httpx.Response(self.search_status, json=response_body)
+
         if request.method == "GET" and request.url.path.endswith(f"/contacts/{self.contact_id}"):
             return httpx.Response(self.contact_status, json=self.contact_body)
 
@@ -144,8 +192,10 @@ class MockHubSpot:
             self.note_id = str(800_000_000 + uuid.uuid4().int % 99_000_000)
             payload = json.loads(request.content)
             self.note_payloads.append(payload)
-            if self.note_exception is not None:
+            if self.note_exception is not None and not self.save_note_before_exception:
                 raise self.note_exception
+            if self.note_status == 429:
+                return httpx.Response(429, json={"message": "private rate limit"})
             properties = payload["properties"]
             self.saved_note = {
                 "id": self.note_id,
@@ -164,8 +214,11 @@ class MockHubSpot:
                     }
                 },
             }
+            self.saved_notes[self.note_id] = self.saved_note
             if self.before_note_response is not None:
                 await self.before_note_response()
+            if self.note_exception is not None:
+                raise self.note_exception
             if self.malformed_note_response:
                 return httpx.Response(201, content=b"not-json")
             if self.note_response is not None:
@@ -180,10 +233,46 @@ class MockHubSpot:
                 response_body["associations"] = {"contacts": {"results": []}}
             return httpx.Response(self.note_status, json=response_body)
 
-        if request.method == "GET" and request.url.path.endswith(f"/notes/{self.note_id}"):
-            if self.saved_note is None:
+        path_parts = request.url.path.rstrip("/").split("/")
+        if (
+            request.method == "PUT"
+            and len(path_parts) >= 4
+            and path_parts[-4] == "associations"
+            and path_parts[-3] == "contact"
+        ):
+            self.association_put_count += 1
+            if self.before_association_put is not None:
+                await self.before_association_put()
+            note_id = path_parts[-5]
+            contact_id = path_parts[-2]
+            note = self.saved_notes.get(note_id)
+            if note is None:
                 return httpx.Response(404, json={"message": "private missing note"})
-            return httpx.Response(200, json=self.saved_note)
+            if (
+                self.association_put_exception is not None
+                and not self.association_put_after_mutation
+            ):
+                raise self.association_put_exception
+            note["associations"] = {"contacts": {"results": [{"id": contact_id}]}}
+            if self.association_put_exception is not None:
+                raise self.association_put_exception
+            return httpx.Response(self.association_put_status)
+
+        if request.method == "GET" and len(path_parts) == 6 and path_parts[-2] == "notes":
+            self.note_read_count += 1
+            note_id = path_parts[-1]
+            if self.note_read_fail_on_count == self.note_read_count:
+                return httpx.Response(503, json={"message": "private read failure"})
+            if self.note_read_exception is not None:
+                raise self.note_read_exception
+            if self.note_read_status != 200:
+                return httpx.Response(self.note_read_status, json={"message": "private read error"})
+            note = self.saved_notes.get(note_id)
+            if note is None:
+                return httpx.Response(404, json={"message": "private missing note"})
+            if self.note_read_override is not None:
+                return httpx.Response(200, json=self.note_read_override)
+            return httpx.Response(200, json=note)
 
         return httpx.Response(404, json={"message": "private unexpected request"})
 
@@ -355,6 +444,30 @@ async def _linked_provider_id(session_factory, contact_id: uuid.UUID) -> str:
     async with session_factory() as session:
         link = await session.get(CRMContactLink, contact_id)
         return "missing" if link is None else link.hubspot_contact_id
+
+
+async def _bind_provider_identity(session_factory, source: Source, provider: MockHubSpot) -> None:
+    async with session_factory() as session:
+        contact = await session.get(Contact, source.contact_id)
+        assert contact is not None
+        props = provider.contact_body["properties"]
+        assert isinstance(props, dict)
+        props["phone"] = contact.phone_e164
+
+
+async def _leave_possible_note(
+    session_factory,
+    source: Source,
+    provider: MockHubSpot,
+    *,
+    saved_before_failure: bool = True,
+    failure: BaseException | None = None,
+) -> None:
+    provider.note_exception = failure or httpx.ReadTimeout("private post timeout")
+    provider.save_note_before_exception = saved_before_failure
+    first = await _run(session_factory, source, provider)
+    assert first.outcome is BookingOutcome.UNCERTAIN
+    provider.note_exception = None
 
 
 async def _crm_execution(session_factory, source: Source) -> ToolExecution | None:
@@ -841,7 +954,7 @@ async def test_note_response_without_associations_is_verified_with_get_note(
 
 @pytest.mark.parametrize(
     "contact_ids",
-    [[], ["unrelated-contact-id"], ["current-contact-id", "unrelated-contact-id"]],
+    [["unrelated-contact-id"], ["current-contact-id", "unrelated-contact-id"]],
 )
 async def test_missing_or_conflicting_note_association_remains_uncertain(
     session_factory, contact_ids: list[str]
@@ -904,7 +1017,7 @@ async def test_archived_or_wrong_timestamp_note_remains_uncertain(
         (None, httpx.ReadTimeout("private possible transmission")),
     ],
 )
-async def test_possible_post_timeout_or_5xx_retains_uncertainty_without_retry(
+async def test_possible_post_timeout_or_5xx_recovers_without_duplicate_post(
     session_factory, status: int | None, exception: BaseException | None
 ) -> None:
     source = await _create_source(session_factory)
@@ -912,6 +1025,7 @@ async def test_possible_post_timeout_or_5xx_retains_uncertainty_without_retry(
     if status is not None:
         provider.note_status = status
     provider.note_exception = exception
+    provider.save_note_before_exception = status == 500
     async with session_factory() as session:
         contact = await session.get(Contact, source.contact_id)
         assert contact is not None
@@ -924,10 +1038,35 @@ async def test_possible_post_timeout_or_5xx_retains_uncertainty_without_retry(
     execution = await _crm_execution(session_factory, source)
 
     assert first.outcome is BookingOutcome.UNCERTAIN
-    assert second.outcome is BookingOutcome.UNCERTAIN
     assert second.replayed is True
-    assert execution is not None and execution.status is ToolExecutionStatus.STARTED
+    if status == 500:
+        assert second.outcome is BookingOutcome.REPLAYED
+        assert second.hubspot_note_id == provider.note_id
+        assert execution is not None and execution.status is ToolExecutionStatus.SUCCEEDED
+    else:
+        assert second.outcome is BookingOutcome.UNCERTAIN
+        assert execution is not None and execution.status is ToolExecutionStatus.STARTED
     assert provider.note_create_count == 1
+
+
+async def test_confirmed_rate_limit_allows_only_a_later_explicit_same_key_retry(
+    session_factory,
+) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    provider.note_status = 429
+
+    first = await _run(session_factory, source, provider)
+    claim = await _crm_execution(session_factory, source)
+    provider.note_status = 201
+    second = await _run(session_factory, source, provider)
+
+    assert first.outcome is BookingOutcome.FAILED
+    assert first.next_action is BookingOutcomeNextAction.RETRY_SAME_KEY
+    assert claim is not None and claim.status is ToolExecutionStatus.FAILED
+    assert second.outcome is BookingOutcome.WRITTEN
+    assert provider.note_create_count == 2
 
 
 @pytest.mark.parametrize(
@@ -1299,7 +1438,9 @@ async def test_claim_insert_failure_prevents_note_post(session_factory) -> None:
     assert provider.note_create_count == 0
 
 
-async def test_no_note_search_or_association_repair_runs_in_task_12(session_factory) -> None:
+async def test_fully_verified_post_skips_reconciliation_and_association_repair(
+    session_factory,
+) -> None:
     source = await _create_source(session_factory)
     provider = MockHubSpot(email=None, phone=None)
     async with session_factory() as session:
@@ -1314,3 +1455,549 @@ async def test_no_note_search_or_association_repair_runs_in_task_12(session_fact
     assert result.outcome is BookingOutcome.WRITTEN
     assert all("/notes/search" not in request.url.path for request in provider.requests)
     assert all("/associations/contact/" not in request.url.path for request in provider.requests)
+
+
+@pytest.mark.parametrize(
+    ("failure", "save_note"),
+    [
+        (httpx.ReadTimeout("private timeout"), True),
+        (None, False),
+    ],
+)
+async def test_same_key_reconciles_possible_note_without_second_post(
+    session_factory, failure: BaseException | None, save_note: bool
+) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    if failure is None:
+        provider.note_status = 500
+    await _leave_possible_note(
+        session_factory,
+        source,
+        provider,
+        saved_before_failure=save_note,
+        failure=failure,
+    )
+
+    if save_note:
+        result = await _run(session_factory, source, provider)
+        assert result.outcome is BookingOutcome.REPLAYED
+        assert result.hubspot_note_id == provider.note_id
+        assert provider.note_create_count == 1
+        assert provider.note_search_count == 1
+        execution = await _crm_execution(session_factory, source)
+        assert execution is not None and execution.status is ToolExecutionStatus.SUCCEEDED
+    else:
+        result = await _run(session_factory, source, provider)
+        assert result.outcome is BookingOutcome.UNCERTAIN
+        assert result.next_action is BookingOutcomeNextAction.RECONCILE_SAME_KEY
+        assert provider.note_create_count == 1
+
+
+async def test_delayed_note_indexing_stays_uncertain_then_recovers(session_factory) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    provider.search_visible_after = 1
+
+    first_recovery = await _run(session_factory, source, provider)
+    second_recovery = await _run(session_factory, source, provider)
+
+    assert first_recovery.outcome is BookingOutcome.UNCERTAIN
+    assert first_recovery.next_action is BookingOutcomeNextAction.RECONCILE_SAME_KEY
+    assert second_recovery.outcome is BookingOutcome.REPLAYED
+    assert provider.note_create_count == 1
+    assert provider.note_search_count == 2
+
+
+@pytest.mark.parametrize(
+    "body_change",
+    [
+        "unrelated booking-execution marker substring",
+        "append an unrelated line",
+    ],
+)
+async def test_reconciliation_requires_exact_marker_and_canonical_body(
+    session_factory, body_change: str
+) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    assert provider.saved_note is not None
+    properties = provider.saved_note["properties"]
+    assert isinstance(properties, dict)
+    if body_change == "unrelated booking-execution marker substring":
+        properties["hs_note_body"] = f"prefix booking-execution:{source.source_id} suffix"
+    else:
+        properties["hs_note_body"] = f"{properties['hs_note_body']}\nUnapproved extra text"
+
+    result = await _run(session_factory, source, provider)
+
+    assert result.outcome is BookingOutcome.UNCERTAIN
+    assert result.hubspot_note_id is None
+    assert provider.note_create_count == 1
+
+
+@pytest.mark.parametrize(
+    ("archived", "timestamp"),
+    [(True, None), (False, "2026-10-25T16:00:00.123457Z")],
+)
+async def test_reconciliation_rejects_archived_or_wrong_timestamp(
+    session_factory, archived: bool, timestamp: str | None
+) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    assert provider.saved_note is not None
+    provider.saved_note["archived"] = archived
+    if timestamp is not None:
+        properties = provider.saved_note["properties"]
+        assert isinstance(properties, dict)
+        properties["hs_timestamp"] = timestamp
+
+    result = await _run(session_factory, source, provider)
+
+    assert result.outcome is BookingOutcome.UNCERTAIN
+    assert provider.note_create_count == 1
+    assert provider.association_put_count == 0
+
+
+async def test_reconciliation_rejects_duplicate_exact_marker_notes(session_factory) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    assert provider.saved_note is not None
+    duplicate_id = str(int(provider.note_id) + 1)
+    duplicate = dict(provider.saved_note)
+    duplicate["id"] = duplicate_id
+    provider.saved_notes[duplicate_id] = duplicate
+
+    result = await _run(session_factory, source, provider)
+
+    assert result.outcome is BookingOutcome.UNCERTAIN
+    assert result.error_code is BookingOutcomeErrorCode.NOTE_SEARCH_AMBIGUOUS
+    assert result.next_action is BookingOutcomeNextAction.OPERATOR_REVIEW
+    assert provider.note_create_count == 1
+    assert provider.association_put_count == 0
+
+
+async def test_reconciliation_does_not_select_first_incomplete_search_page(session_factory) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    provider.search_incomplete = True
+
+    result = await _run(session_factory, source, provider)
+
+    assert result.outcome is BookingOutcome.UNCERTAIN
+    assert result.error_code is BookingOutcomeErrorCode.NOTE_SEARCH_INCOMPLETE
+    assert provider.note_read_count == 0
+    assert provider.note_create_count == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "exception"),
+    [(429, None), (503, None), (None, httpx.ReadTimeout("private search timeout"))],
+)
+async def test_search_provider_failures_preserve_uncertain_claim(
+    session_factory, status: int | None, exception: BaseException | None
+) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    provider.search_status = status or 200
+    provider.search_exception = exception
+
+    result = await _run(session_factory, source, provider)
+    execution = await _crm_execution(session_factory, source)
+
+    assert result.outcome is BookingOutcome.UNCERTAIN
+    assert result.replayed is True
+    assert execution is not None and execution.status is ToolExecutionStatus.STARTED
+    assert provider.note_create_count == 1
+
+
+async def test_accepted_malformed_response_is_reconciled_by_same_key(session_factory) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    provider.malformed_note_response = True
+
+    first = await _run(session_factory, source, provider)
+    provider.malformed_note_response = False
+    second = await _run(session_factory, source, provider)
+
+    assert first.outcome is BookingOutcome.UNCERTAIN
+    assert second.outcome is BookingOutcome.REPLAYED
+    assert second.hubspot_note_id == provider.note_id
+    assert provider.note_create_count == 1
+
+
+async def test_note_created_before_local_terminalization_failure_is_reconciled(
+    session_factory, monkeypatch
+) -> None:
+    from receptionist.application import crm_booking_outcome as booking_outcome
+
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    original_terminalize = booking_outcome._terminalize_claim
+
+    def fail_first_terminalization(session, execution, result) -> None:
+        if result.outcome is BookingOutcome.WRITTEN:
+            raise SQLAlchemyError("private terminal write failure")
+        original_terminalize(session, execution, result)
+
+    monkeypatch.setattr(booking_outcome, "_terminalize_claim", fail_first_terminalization)
+    first = await _run(session_factory, source, provider)
+    monkeypatch.setattr(booking_outcome, "_terminalize_claim", original_terminalize)
+    second = await _run(session_factory, source, provider)
+
+    assert first.outcome is BookingOutcome.UNCERTAIN
+    assert first.hubspot_note_id == provider.note_id
+    assert second.outcome is BookingOutcome.REPLAYED
+    assert provider.note_create_count == 1
+
+
+async def test_reconciliation_ignores_candidate_with_different_exact_marker(
+    session_factory,
+) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider, saved_before_failure=False)
+    other_id = str(int(provider.note_id) + 1)
+    provider.saved_notes[other_id] = {
+        "id": other_id,
+        "properties": {
+            "hs_note_body": f"Source operation: booking-execution:{source.source_id}-other",
+            "hs_timestamp": "2026-10-25T16:00:00.123456Z",
+        },
+        "archived": False,
+        "associations": {"contacts": {"results": [{"id": provider.contact_id}]}},
+    }
+
+    result = await _run(session_factory, source, provider)
+
+    assert result.outcome is BookingOutcome.UNCERTAIN
+    assert result.error_code is BookingOutcomeErrorCode.NOTE_IDENTITY_UNVERIFIED
+    assert provider.note_create_count == 1
+
+
+async def test_invalid_search_note_id_preserves_uncertainty(session_factory) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider, saved_before_failure=False)
+    provider.search_response = {
+        "total": 1,
+        "results": [
+            {
+                "id": "invalid-note-id",
+                "properties": {"hs_note_body": "invalid", "hs_timestamp": "now"},
+            }
+        ],
+    }
+
+    result = await _run(session_factory, source, provider)
+
+    assert result.outcome is BookingOutcome.UNCERTAIN
+    assert provider.note_create_count == 1
+    assert provider.note_read_count == 0
+
+
+async def test_provider_note_read_failure_keeps_durable_claim_uncertain(session_factory) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    provider.note_read_status = 503
+
+    result = await _run(session_factory, source, provider)
+    claim = await _crm_execution(session_factory, source)
+
+    assert result.outcome is BookingOutcome.UNCERTAIN
+    assert claim is not None and claim.status is ToolExecutionStatus.STARTED
+    assert provider.note_create_count == 1
+    assert provider.association_put_count == 0
+
+
+async def test_association_put_timeout_is_read_back_before_replay(session_factory) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    assert provider.saved_note is not None
+    provider.saved_note["associations"] = {"contacts": {"results": []}}
+    provider.association_put_exception = httpx.ReadTimeout("private association timeout")
+    provider.association_put_after_mutation = True
+
+    result = await _run(session_factory, source, provider)
+
+    assert result.outcome is BookingOutcome.REPLAYED
+    assert provider.association_put_count == 1
+    assert provider.note_create_count == 1
+
+
+async def test_claim_portal_binding_mismatch_is_not_reconciled(session_factory) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    claim = await _crm_execution(session_factory, source)
+    assert claim is not None
+    async with session_factory.begin() as session:
+        current = await session.get(ToolExecution, claim.id)
+        assert current is not None
+        assert current.sanitized_arguments is not None
+        current.sanitized_arguments = {
+            **current.sanitized_arguments,
+            "hubspot_portal_id": "654321",
+        }
+
+    result = await _run(session_factory, source, provider)
+
+    assert result.outcome is BookingOutcome.UNCERTAIN
+    assert result.error_code is BookingOutcomeErrorCode.CLAIM_BINDING_MISMATCH
+    assert result.next_action is BookingOutcomeNextAction.OPERATOR_REVIEW
+    assert provider.note_search_count == 0
+    assert provider.note_create_count == 1
+
+
+async def test_account_preflight_failure_does_not_search_or_repair(session_factory) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    provider.portal_id = 654321
+
+    result = await _run(session_factory, source, provider)
+
+    assert result.outcome is BookingOutcome.UNCERTAIN
+    assert result.error_code is BookingOutcomeErrorCode.ACCOUNT_MISMATCH
+    assert result.next_action is BookingOutcomeNextAction.OPERATOR_REVIEW
+    assert provider.note_search_count == 0
+    assert provider.association_put_count == 0
+    assert provider.note_create_count == 1
+
+
+@pytest.mark.parametrize(
+    ("association_kind", "association_ids"),
+    [
+        ("wrong", ["other-contact"]),
+        ("multiple", ["expected-contact", "other-contact"]),
+        ("malformed", None),
+        ("missing", None),
+    ],
+)
+async def test_reconciliation_never_repairs_conflicting_or_incomplete_associations(
+    session_factory, association_kind: str, association_ids: list[str] | None
+) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    assert provider.saved_note is not None
+    if association_kind == "missing":
+        provider.saved_note.pop("associations", None)
+    elif association_kind == "malformed":
+        provider.saved_note["associations"] = {"contacts": {"results": "malformed"}}
+    else:
+        assert association_ids is not None
+        provider.saved_note["associations"] = {
+            "contacts": {
+                "results": [
+                    {"id": provider.contact_id if value == "expected-contact" else value}
+                    for value in association_ids
+                ]
+            }
+        }
+
+    result = await _run(session_factory, source, provider)
+
+    assert result.outcome is BookingOutcome.UNCERTAIN
+    assert provider.association_put_count == 0
+    assert provider.note_create_count == 1
+
+
+async def test_verified_empty_association_is_narrowly_repaired(session_factory) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    assert provider.saved_note is not None
+    provider.saved_note["associations"] = {"contacts": {"results": []}}
+
+    result = await _run(session_factory, source, provider)
+
+    assert result.outcome is BookingOutcome.REPLAYED
+    assert result.hubspot_note_id == provider.note_id
+    assert provider.association_put_count == 1
+    assert provider.note_create_count == 1
+    assert provider.saved_note["associations"] == {
+        "contacts": {"results": [{"id": provider.contact_id}]}
+    }
+
+
+async def test_repair_readback_failure_is_reconciled_without_second_put(session_factory) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    assert provider.saved_note is not None
+    provider.saved_note["associations"] = {"contacts": {"results": []}}
+    provider.note_read_fail_on_count = 3
+
+    first_recovery = await _run(session_factory, source, provider)
+    provider.note_read_fail_on_count = None
+    second_recovery = await _run(session_factory, source, provider)
+
+    assert first_recovery.outcome is BookingOutcome.UNCERTAIN
+    assert second_recovery.outcome is BookingOutcome.REPLAYED
+    assert provider.association_put_count == 1
+    assert provider.note_create_count == 1
+
+
+async def test_unavailable_association_metadata_is_not_treated_as_empty(session_factory) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    assert provider.saved_note is not None
+    provider.saved_note.pop("associations", None)
+
+    result = await _run(session_factory, source, provider)
+
+    assert result.outcome is BookingOutcome.UNCERTAIN
+    assert provider.association_put_count == 0
+    assert provider.note_create_count == 1
+
+
+async def test_concurrent_recovery_serializes_same_key_and_association_repair(
+    session_factory,
+) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    assert provider.saved_note is not None
+    provider.saved_note["associations"] = {"contacts": {"results": []}}
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_association_put() -> None:
+        entered.set()
+        await asyncio.wait_for(release.wait(), timeout=3)
+
+    provider.before_association_put = hold_association_put
+    first_task = asyncio.create_task(_run(session_factory, source, provider))
+    await asyncio.wait_for(entered.wait(), timeout=3)
+    second = await _run(session_factory, source, provider)
+    release.set()
+    first = await asyncio.wait_for(first_task, timeout=3)
+
+    assert first.outcome is BookingOutcome.REPLAYED
+    assert second.outcome is BookingOutcome.UNCERTAIN
+    assert second.error_code is BookingOutcomeErrorCode.OPERATION_IN_PROGRESS
+    assert provider.association_put_count == 1
+    assert provider.note_create_count == 1
+
+
+async def test_changed_mapping_or_source_binding_keeps_uncertain_claim(session_factory) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    async with session_factory.begin() as session:
+        link = await session.get(CRMContactLink, source.contact_id)
+        assert link is not None
+        link.hubspot_contact_id = str(int(link.hubspot_contact_id) + 1)
+
+    changed_mapping = await _run(session_factory, source, provider)
+    assert changed_mapping.outcome is BookingOutcome.UNCERTAIN
+    assert changed_mapping.error_code is BookingOutcomeErrorCode.CLAIM_BINDING_MISMATCH
+    assert provider.note_search_count == 0
+    assert provider.note_create_count == 1
+
+
+async def test_changed_historical_source_keeps_claim_uncertain_without_search(
+    session_factory,
+) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    async with session_factory.begin() as session:
+        execution = await session.get(ToolExecution, source.source_id)
+        assert execution is not None
+        execution.status = ToolExecutionStatus.FAILED
+
+    result = await _run(session_factory, source, provider)
+    claim = await _crm_execution(session_factory, source)
+
+    assert result.outcome is BookingOutcome.UNCERTAIN
+    assert result.next_action is BookingOutcomeNextAction.OPERATOR_REVIEW
+    assert provider.note_search_count == 0
+    assert provider.note_create_count == 1
+    assert claim is not None and claim.status is ToolExecutionStatus.STARTED
+
+
+async def test_recovery_local_terminalization_failure_is_safe_and_replayable(
+    session_factory, monkeypatch
+) -> None:
+    from receptionist.application import crm_booking_outcome as booking_outcome
+
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    original_terminalize = booking_outcome._terminalize_claim
+
+    def fail_recovery_terminalization(session, execution, result) -> None:
+        if result.outcome is BookingOutcome.REPLAYED:
+            raise SQLAlchemyError("private recovery persistence failure")
+        original_terminalize(session, execution, result)
+
+    monkeypatch.setattr(booking_outcome, "_terminalize_claim", fail_recovery_terminalization)
+    first = await _run(session_factory, source, provider)
+    claim = await _crm_execution(session_factory, source)
+    monkeypatch.setattr(booking_outcome, "_terminalize_claim", original_terminalize)
+    second = await _run(session_factory, source, provider)
+
+    assert first.outcome is BookingOutcome.UNCERTAIN
+    assert first.error_code is BookingOutcomeErrorCode.LOCAL_PERSISTENCE_FAILURE
+    assert claim is not None and claim.status is ToolExecutionStatus.STARTED
+    assert second.outcome is BookingOutcome.REPLAYED
+    assert provider.note_create_count == 1
+
+
+async def test_recovery_never_calls_calendar_and_terminalizes_one_claim(session_factory) -> None:
+    source = await _create_source(session_factory)
+    provider = MockHubSpot(email=None, phone=None)
+    await _bind_provider_identity(session_factory, source, provider)
+    await _leave_possible_note(session_factory, source, provider)
+    result = await _run(session_factory, source, provider)
+    claim = await _crm_execution(session_factory, source)
+    async with session_factory() as session:
+        executions = (
+            await session.scalars(
+                select(ToolExecution).where(
+                    ToolExecution.idempotency_key.is_not(None),
+                    ToolExecution.tool_name == "record_booking_outcome",
+                )
+            )
+        ).all()
+
+    assert result.outcome is BookingOutcome.REPLAYED
+    assert claim is not None and claim.status is ToolExecutionStatus.SUCCEEDED
+    assert claim.finished_at is not None
+    assert [execution.id for execution in executions].count(claim.id) == 1
+    assert provider.note_create_count == 1
+    assert all("calendar" not in request.url.host for request in provider.requests)

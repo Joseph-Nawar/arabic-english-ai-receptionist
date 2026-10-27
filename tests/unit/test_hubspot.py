@@ -208,11 +208,11 @@ async def test_note_create_uses_bounded_body_and_exact_contact_association() -> 
         return json_response(
             {
                 "id": "654321",
+                "archived": False,
                 "properties": {
                     "hs_note_body": "Booking confirmed. source-op:abc123",
                     "hs_timestamp": "2026-10-25T10:30:00.000Z",
                 },
-                "archived": False,
                 "associations": {"contacts": {"results": [{"id": "987654"}]}},
             }
         )
@@ -251,6 +251,7 @@ async def test_note_create_preserves_historical_timestamp_microseconds() -> None
         return json_response(
             {
                 "id": "654321",
+                "archived": False,
                 "properties": {
                     "hs_note_body": "source marker",
                     "hs_timestamp": "2026-10-25T10:30:00.123456Z",
@@ -274,6 +275,7 @@ async def test_note_create_preserves_historical_timestamp_microseconds() -> None
 @pytest.mark.asyncio
 async def test_note_search_and_read_use_documented_routes_and_narrow_results() -> None:
     requests: list[httpx.Request] = []
+    marker = "booking-execution:00000000-0000-4000-8000-000000000001"
 
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -284,8 +286,9 @@ async def test_note_search_and_read_use_documented_routes_and_narrow_results() -
                     "results": [
                         {
                             "id": "654321",
+                            "archived": False,
                             "properties": {
-                                "hs_note_body": "source-op:abc123",
+                                "hs_note_body": marker,
                                 "hs_timestamp": "2026-10-25T10:30:00.000Z",
                             },
                         }
@@ -295,8 +298,9 @@ async def test_note_search_and_read_use_documented_routes_and_narrow_results() -
         return json_response(
             {
                 "id": "654321",
+                "archived": False,
                 "properties": {
-                    "hs_note_body": "source-op:abc123",
+                    "hs_note_body": marker,
                     "hs_timestamp": "2026-10-25T10:30:00.000Z",
                 },
                 "associations": {"contacts": {"results": [{"id": "987654"}]}},
@@ -304,7 +308,7 @@ async def test_note_search_and_read_use_documented_routes_and_narrow_results() -
         )
 
     async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
-        found = await client.search_notes("source-op:abc123")
+        found = await client.search_notes(marker)
         note = await client.get_note("654321")
 
     assert found.complete is True
@@ -312,13 +316,133 @@ async def test_note_search_and_read_use_documented_routes_and_narrow_results() -
     assert note.contact_ids == ("987654",)
     assert requests[0].url.path == "/crm/objects/2026-09/notes/search"
     assert json.loads(requests[0].content) == {
-        "query": "source-op:abc123",
+        "query": marker,
         "properties": ["hs_note_body", "hs_timestamp"],
         "limit": 5,
     }
     assert requests[1].method == "GET"
     assert requests[1].url.path == "/crm/objects/2026-09/notes/654321"
     assert requests[1].url.params["associations"] == "contact"
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "source-op:abc123",
+        "booking-execution:not-a-uuid",
+        "booking-execution:00000000-0000-4000-8000-000000000001-extra",
+    ],
+)
+@pytest.mark.asyncio
+async def test_note_search_accepts_only_the_deterministic_booking_marker(marker: str) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return json_response({"total": 0, "results": []})
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(HubSpotProviderError) as exc_info:
+            await client.search_notes(marker)
+
+    assert exc_info.value.code is HubSpotErrorCode.INVALID_REQUEST
+    assert requests == []
+
+
+@pytest.mark.parametrize(
+    ("include_associations", "associations", "expected_ids", "complete"),
+    [
+        (False, None, (), False),
+        (True, {"contacts": {}}, (), False),
+        (True, {"contacts": {"results": []}}, (), True),
+        (
+            True,
+            {
+                "contacts": {
+                    "results": [{"id": "987654"}],
+                    "paging": {"next": {"after": "next-page"}},
+                }
+            },
+            ("987654",),
+            False,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_note_parser_distinguishes_association_evidence_completeness(
+    include_associations: bool,
+    associations: object,
+    expected_ids: tuple[str, ...],
+    complete: bool,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = {
+            "id": "654321",
+            "archived": False,
+            "properties": {"hs_note_body": "source marker", "hs_timestamp": "2026-10-25T10:30:00Z"},
+        }
+        if include_associations:
+            payload["associations"] = associations
+        return json_response(payload)
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        note = await client.get_note("654321")
+
+    assert note.contact_ids == expected_ids
+    assert note.contact_associations_complete is complete
+
+
+@pytest.mark.asyncio
+async def test_malformed_note_association_payload_is_rejected() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(
+            {
+                "id": "654321",
+                "archived": False,
+                "properties": {
+                    "hs_note_body": "source marker",
+                    "hs_timestamp": "2026-10-25T10:30:00Z",
+                },
+                "associations": {"contacts": {"results": "not-a-list"}},
+            }
+        )
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(HubSpotProviderError) as exc_info:
+            await client.get_note("654321")
+
+    assert exc_info.value.code is HubSpotErrorCode.INVALID_RESPONSE
+
+
+@pytest.mark.asyncio
+async def test_association_repair_refuses_missing_association_evidence() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return json_response(
+            {
+                "id": "654321",
+                "archived": False,
+                "properties": {
+                    "hs_note_body": "source marker",
+                    "hs_timestamp": "2026-10-25T10:30:00Z",
+                },
+            }
+        )
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(HubSpotProviderError) as exc_info:
+            await client.ensure_note_contact_association(
+                "654321",
+                "987654",
+                expected_body="source marker",
+                expected_timestamp=datetime(2026, 10, 25, 10, 30, tzinfo=UTC),
+            )
+
+    assert exc_info.value.code is HubSpotErrorCode.INVALID_RESPONSE
+    assert exc_info.value.outcome_uncertain is True
+    assert [request.method for request in requests] == ["GET"]
 
 
 @pytest.mark.asyncio
@@ -347,6 +471,7 @@ async def test_missing_note_contact_association_is_repaired_and_read_back() -> N
     requests: list[httpx.Request] = []
     note_payload: dict[str, object] = {
         "id": "654321",
+        "archived": False,
         "properties": {"hs_note_body": "source-op:abc123", "hs_timestamp": "2026-10-25T10:30:00Z"},
         "associations": {"contacts": {"results": []}},
     }
@@ -359,7 +484,12 @@ async def test_missing_note_contact_association_is_repaired_and_read_back() -> N
         return json_response(note_payload)
 
     async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
-        note = await client.ensure_note_contact_association("654321", "987654")
+        note = await client.ensure_note_contact_association(
+            "654321",
+            "987654",
+            expected_body="source-op:abc123",
+            expected_timestamp=datetime(2026, 10, 25, 10, 30, tzinfo=UTC),
+        )
 
     assert note.contact_ids == ("987654",)
     assert [(request.method, request.url.path) for request in requests] == [
@@ -381,6 +511,7 @@ async def test_association_repair_refuses_a_different_existing_contact() -> None
         return json_response(
             {
                 "id": "654321",
+                "archived": False,
                 "properties": {
                     "hs_note_body": "source-op:abc123",
                     "hs_timestamp": "2026-10-25T10:30:00Z",
@@ -391,7 +522,50 @@ async def test_association_repair_refuses_a_different_existing_contact() -> None
 
     async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(HubSpotProviderError) as exc_info:
-            await client.ensure_note_contact_association("654321", "987654")
+            await client.ensure_note_contact_association(
+                "654321",
+                "987654",
+                expected_body="source-op:abc123",
+                expected_timestamp=datetime(2026, 10, 25, 10, 30, tzinfo=UTC),
+            )
+
+    assert exc_info.value.code is HubSpotErrorCode.CONFLICT
+    assert [request.method for request in requests] == ["GET"]
+
+
+@pytest.mark.parametrize(
+    ("body", "timestamp", "archived"),
+    [
+        ("changed body", "2026-10-25T10:30:00Z", False),
+        ("source-op:abc123", "2026-10-25T10:31:00Z", False),
+        ("source-op:abc123", "2026-10-25T10:30:00Z", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_association_repair_rechecks_note_identity_before_put(
+    body: str, timestamp: str, archived: bool
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return json_response(
+            {
+                "id": "654321",
+                "properties": {"hs_note_body": body, "hs_timestamp": timestamp},
+                "archived": archived,
+                "associations": {"contacts": {"results": []}},
+            }
+        )
+
+    async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(HubSpotProviderError) as exc_info:
+            await client.ensure_note_contact_association(
+                "654321",
+                "987654",
+                expected_body="source-op:abc123",
+                expected_timestamp=datetime(2026, 10, 25, 10, 30, tzinfo=UTC),
+            )
 
     assert exc_info.value.code is HubSpotErrorCode.CONFLICT
     assert [request.method for request in requests] == ["GET"]
@@ -712,7 +886,11 @@ async def test_association_write_with_unusable_readback_is_uncertain_without_sec
             return json_response(
                 {
                     "id": "654321",
-                    "properties": {"hs_note_body": "source-op:abc123", "hs_timestamp": "now"},
+                    "archived": False,
+                    "properties": {
+                        "hs_note_body": "source-op:abc123",
+                        "hs_timestamp": "2026-10-25T10:30:00Z",
+                    },
                     "associations": {"contacts": {"results": []}},
                 }
             )
@@ -723,7 +901,12 @@ async def test_association_write_with_unusable_readback_is_uncertain_without_sec
 
     async with HubSpotClient(settings(), transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(HubSpotProviderError) as exc_info:
-            await client.ensure_note_contact_association("654321", "987654")
+            await client.ensure_note_contact_association(
+                "654321",
+                "987654",
+                expected_body="source-op:abc123",
+                expected_timestamp=datetime(2026, 10, 25, 10, 30, tzinfo=UTC),
+            )
 
     error = exc_info.value
     assert error.code is HubSpotErrorCode.INVALID_RESPONSE
@@ -974,7 +1157,12 @@ async def test_failed_preflight_blocks_contact_note_and_association_writes() -> 
                 body="Booking confirmed. source-op:abc123",
                 timestamp=datetime(2026, 10, 25, 10, 30, tzinfo=UTC),
             ),
-            lambda: client.ensure_note_contact_association("654321", "987654"),
+            lambda: client.ensure_note_contact_association(
+                "654321",
+                "987654",
+                expected_body="source-op:abc123",
+                expected_timestamp=datetime(2026, 10, 25, 10, 30, tzinfo=UTC),
+            ),
         ):
             with pytest.raises(HubSpotProviderError) as exc_info:
                 await write()

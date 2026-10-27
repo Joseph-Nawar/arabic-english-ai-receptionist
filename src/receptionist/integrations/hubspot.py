@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -140,6 +141,7 @@ class HubSpotNoteSnapshot:
     body: str | None
     timestamp: str | None
     contact_ids: tuple[str, ...]
+    contact_associations_complete: bool
     archived: bool
 
 
@@ -414,13 +416,32 @@ class HubSpotClient:
         return _parse_note(payload)
 
     async def ensure_note_contact_association(
-        self, note_id: str, contact_id: str
+        self,
+        note_id: str,
+        contact_id: str,
+        *,
+        expected_body: str,
+        expected_timestamp: datetime,
     ) -> HubSpotNoteSnapshot:
         """Repair only a verified absent Note-to-Contact association and read it back."""
         self._assert_write_activation()
         note_record_id = _record_id(note_id)
         contact_record_id = _record_id(contact_id)
+        note_body = _nonblank_text(expected_body, max_length=MAX_NOTE_BODY_CHARS)
+        if (
+            not isinstance(expected_timestamp, datetime)
+            or expected_timestamp.tzinfo is None
+            or expected_timestamp.utcoffset() is None
+        ):
+            raise HubSpotProviderError(HubSpotErrorCode.INVALID_REQUEST)
+        expected_utc = expected_timestamp.astimezone(UTC)
         current = await self.get_note(note_record_id)
+        if current.id != note_record_id:
+            raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE, outcome_uncertain=True)
+        if not _note_snapshot_matches(current, note_body, expected_utc):
+            raise HubSpotProviderError(HubSpotErrorCode.CONFLICT)
+        if not current.contact_associations_complete:
+            raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE, outcome_uncertain=True)
         if current.contact_ids == (contact_record_id,):
             return current
         if current.contact_ids:
@@ -435,6 +456,30 @@ class HubSpotClient:
                 write=True,
             )
         except HubSpotProviderError as error:
+            if error.outcome_uncertain:
+                try:
+                    current = await self.get_note(note_record_id)
+                except HubSpotProviderError as read_error:
+                    if read_error.code in {
+                        HubSpotErrorCode.INVALID_RESPONSE,
+                        HubSpotErrorCode.RESPONSE_TOO_LARGE,
+                    }:
+                        raise _uncertain(read_error) from None
+                    raise _uncertain(error) from None
+                if (
+                    current.id == note_record_id
+                    and _note_snapshot_matches(current, note_body, expected_utc)
+                    and current.contact_associations_complete
+                    and current.contact_ids == (contact_record_id,)
+                ):
+                    return current
+                if current.contact_ids:
+                    raise HubSpotProviderError(
+                        HubSpotErrorCode.CONFLICT,
+                        outcome_uncertain=True,
+                    ) from None
+                if not current.contact_associations_complete:
+                    raise _uncertain(error) from None
             if error.code in {
                 HubSpotErrorCode.INVALID_RESPONSE,
                 HubSpotErrorCode.RESPONSE_TOO_LARGE,
@@ -446,7 +491,12 @@ class HubSpotClient:
             repaired = await self.get_note(note_record_id)
         except HubSpotProviderError as error:
             raise _uncertain(error) from None
-        if repaired.contact_ids != (contact_record_id,):
+        if (
+            repaired.id != note_record_id
+            or not _note_snapshot_matches(repaired, note_body, expected_utc)
+            or not repaired.contact_associations_complete
+            or repaired.contact_ids != (contact_record_id,)
+        ):
             raise HubSpotProviderError(HubSpotErrorCode.CONFLICT, outcome_uncertain=True)
         return repaired
 
@@ -682,7 +732,14 @@ def _nonblank_text(value: str, *, max_length: int) -> str:
 
 def _note_marker(value: str) -> str:
     marker = _nonblank_text(value, max_length=100)
-    if not marker.startswith("source-op:"):
+    prefix = "booking-execution:"
+    if not marker.startswith(prefix):
+        raise HubSpotProviderError(HubSpotErrorCode.INVALID_REQUEST)
+    try:
+        execution_id = uuid.UUID(marker[len(prefix) :])
+    except (ValueError, AttributeError):
+        raise HubSpotProviderError(HubSpotErrorCode.INVALID_REQUEST) from None
+    if marker != f"{prefix}{execution_id}":
         raise HubSpotProviderError(HubSpotErrorCode.INVALID_REQUEST)
     return marker
 
@@ -761,11 +818,12 @@ def _parse_note(payload: dict[str, Any]) -> HubSpotNoteSnapshot:
         record_id = _record_id(record_id)
     except HubSpotProviderError:
         raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE) from None
-    archived = payload.get("archived", False)
+    archived = payload.get("archived")
     if not isinstance(archived, bool):
         raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
 
     contact_ids: tuple[str, ...] = ()
+    contact_associations_complete = False
     associations = payload.get("associations")
     if associations is not None:
         if not isinstance(associations, dict):
@@ -774,20 +832,61 @@ def _parse_note(payload: dict[str, Any]) -> HubSpotNoteSnapshot:
         if contacts is not None:
             if not isinstance(contacts, dict):
                 raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
-            results = contacts.get("results", [])
-            if not isinstance(results, list) or any(not isinstance(item, dict) for item in results):
-                raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
-            try:
-                contact_ids = tuple(_record_id(_required_string(item, "id")) for item in results)
-            except HubSpotProviderError:
-                raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE) from None
+            if "results" in contacts:
+                results = contacts["results"]
+                if not isinstance(results, list) or any(
+                    not isinstance(item, dict) for item in results
+                ):
+                    raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
+                try:
+                    contact_ids = tuple(
+                        _record_id(_required_string(item, "id")) for item in results
+                    )
+                except HubSpotProviderError:
+                    raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE) from None
+                paging = contacts.get("paging")
+                if "paging" not in contacts or paging is None:
+                    contact_associations_complete = True
+                elif isinstance(paging, dict):
+                    next_page = paging.get("next")
+                    if next_page is None:
+                        contact_associations_complete = True
+                    elif (
+                        isinstance(next_page, dict)
+                        and isinstance(next_page.get("after"), str)
+                        and next_page["after"]
+                    ):
+                        contact_associations_complete = False
+                    else:
+                        raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
+                else:
+                    raise HubSpotProviderError(HubSpotErrorCode.INVALID_RESPONSE)
 
     return HubSpotNoteSnapshot(
         id=record_id,
         body=_optional_string(properties, "hs_note_body"),
         timestamp=_optional_string(properties, "hs_timestamp"),
         contact_ids=contact_ids,
+        contact_associations_complete=contact_associations_complete,
         archived=archived,
+    )
+
+
+def _note_snapshot_matches(
+    note: HubSpotNoteSnapshot,
+    expected_body: str,
+    expected_timestamp_utc: datetime,
+) -> bool:
+    if note.archived or note.body != expected_body or note.timestamp is None:
+        return False
+    try:
+        timestamp = datetime.fromisoformat(note.timestamp.replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (
+        timestamp.tzinfo is not None
+        and timestamp.utcoffset() is not None
+        and timestamp.astimezone(UTC) == expected_timestamp_utc
     )
 
 

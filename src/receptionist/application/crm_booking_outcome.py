@@ -91,6 +91,10 @@ class BookingOutcomeErrorCode(StrEnum):
     PROVIDER_VALIDATION = "provider_validation"
     INVALID_PROVIDER_RESPONSE = "invalid_provider_response"
     NOTE_IDENTITY_UNVERIFIED = "note_identity_unverified"
+    NOTE_SEARCH_AMBIGUOUS = "note_search_ambiguous"
+    NOTE_SEARCH_INCOMPLETE = "note_search_incomplete"
+    NOTE_ASSOCIATION_CONFLICT = "note_association_conflict"
+    CLAIM_BINDING_MISMATCH = "claim_binding_mismatch"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     OPERATION_IN_PROGRESS = "operation_in_progress"
     LOCAL_STATE_CHANGED = "local_state_changed"
@@ -129,6 +133,22 @@ class _ContactBinding:
     phone_e164: str | None
     verified_email: str | None
     default_phone_region: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ExistingClaim:
+    id: UUID
+    tool_name: str
+    conversation_id: UUID
+    status: ToolExecutionStatus
+    sanitized_arguments: object
+    sanitized_result: object
+
+
+@dataclass(frozen=True, slots=True)
+class _HubSpotClients:
+    preflight: HubSpotClient
+    operation: HubSpotClient
 
 
 def _result(
@@ -208,13 +228,18 @@ async def record_booking_outcome(
     *,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> BookingOutcomeResult:
-    """Write one structured Note from a validated, committed historical source."""
+    """Write or explicitly reconcile one structured Note from immutable evidence."""
     if not isinstance(request, BookingOutcomeRequest):
         return _result(
             BookingOutcome.FAILED,
             error_code=BookingOutcomeErrorCode.INVALID_REQUEST,
             next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
         )
+
+    idempotency_key = _note_idempotency_key(request.source_tool_execution_id)
+    existing = await _existing_claim(session_factory, idempotency_key, request)
+    if isinstance(existing, BookingOutcomeResult):
+        return existing
 
     validation = await validate_booking_evidence(
         session_factory,
@@ -224,6 +249,8 @@ async def record_booking_outcome(
         ),
     )
     if validation.outcome is not BookingEvidenceValidationOutcome.VALID:
+        if isinstance(existing, _ExistingClaim) and existing.status is ToolExecutionStatus.STARTED:
+            return _uncertain_from_validation(validation.outcome)
         return _validation_failure(validation.outcome)
     evidence = validation.evidence
     if evidence is None:
@@ -233,12 +260,14 @@ async def record_booking_outcome(
             next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
         )
 
-    idempotency_key = _note_idempotency_key(evidence.source_tool_execution_id)
-    existing = await _existing_claim(session_factory, evidence, idempotency_key)
-    if existing is not None:
-        return existing
-
     if not _settings_configured(settings):
+        if isinstance(existing, _ExistingClaim) and existing.status is ToolExecutionStatus.STARTED:
+            return _result(
+                BookingOutcome.UNCERTAIN,
+                replayed=True,
+                error_code=BookingOutcomeErrorCode.ACTIVATION_REQUIRED,
+                next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+            )
         return _result(
             BookingOutcome.NOT_CONFIGURED,
             error_code=BookingOutcomeErrorCode.ACTIVATION_REQUIRED,
@@ -253,58 +282,88 @@ async def record_booking_outcome(
             expected_portal_id=expected_portal,
         )
     except SQLAlchemyError:
+        if isinstance(existing, _ExistingClaim) and existing.status is ToolExecutionStatus.STARTED:
+            return _result(
+                BookingOutcome.UNCERTAIN,
+                replayed=True,
+                error_code=BookingOutcomeErrorCode.LOCAL_PERSISTENCE_FAILURE,
+                next_action=BookingOutcomeNextAction.RECONCILE_SAME_KEY,
+            )
         return _local_persistence_failure()
     if binding is None:
+        if isinstance(existing, _ExistingClaim) and existing.status is ToolExecutionStatus.STARTED:
+            return _result(
+                BookingOutcome.UNCERTAIN,
+                replayed=True,
+                error_code=BookingOutcomeErrorCode.CLAIM_BINDING_MISMATCH,
+                next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+            )
         return _no_verified_contact()
+    if (
+        isinstance(existing, _ExistingClaim)
+        and existing.status is ToolExecutionStatus.STARTED
+        and not _claim_binding_matches(existing.sanitized_arguments, evidence, binding)
+    ):
+        return _result(
+            BookingOutcome.UNCERTAIN,
+            replayed=True,
+            error_code=BookingOutcomeErrorCode.CLAIM_BINDING_MISMATCH,
+            next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+        )
+
+    clients = await _prepare_hubspot_clients(
+        settings,
+        transport,
+        expected_key=settings.hubspot_service_key,
+        expected_portal=expected_portal,
+    )
+    if isinstance(clients, BookingOutcomeResult):
+        if isinstance(existing, _ExistingClaim) and existing.status is ToolExecutionStatus.STARTED:
+            return _uncertain_from_prewrite_failure(clients)
+        return clients
 
     try:
-        preflight_client = HubSpotClient(settings, transport=transport)
-    except HubSpotProviderError as error:
-        return _prewrite_provider_failure(error)
-
-    operation_client: HubSpotClient | None = None
-    try:
-        preflight = await preflight_client.preflight_account()
-        failure = _preflight_failure(preflight)
-        if failure is not None:
-            return failure
+        identity_failure = await _verify_provider_contact(clients.operation, binding)
+        if identity_failure is not None:
+            if (
+                isinstance(existing, _ExistingClaim)
+                and existing.status is ToolExecutionStatus.STARTED
+            ):
+                return _result(
+                    BookingOutcome.UNCERTAIN,
+                    replayed=True,
+                    error_code=BookingOutcomeErrorCode.CLAIM_BINDING_MISMATCH,
+                    next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+                )
+            return identity_failure
         if not _settings_unchanged(settings, expected_key, expected_portal):
+            if (
+                isinstance(existing, _ExistingClaim)
+                and existing.status is ToolExecutionStatus.STARTED
+            ):
+                return _result(
+                    BookingOutcome.UNCERTAIN,
+                    replayed=True,
+                    error_code=BookingOutcomeErrorCode.ACCOUNT_MISMATCH,
+                    next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+                )
             return _result(
                 BookingOutcome.NOT_CONFIGURED,
                 error_code=BookingOutcomeErrorCode.ACCOUNT_MISMATCH,
                 next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
             )
 
-        mock_transport_only = settings.app_env in {"test", "ci"} and isinstance(
-            transport, httpx.MockTransport
-        )
-        if preflight.writes_enabled:
-            operation_client = preflight_client
-        elif mock_transport_only:
-            # M3A permits isolated MockTransport writes without enabling production capability.
-            operation_client = HubSpotClient(settings, transport=transport)
-        else:
-            return _result(
-                BookingOutcome.NOT_CONFIGURED,
-                error_code=BookingOutcomeErrorCode.ACTIVATION_REQUIRED,
-                next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
-            )
-
-        provider_contact = await operation_client.get_contact_by_id(binding.hubspot_contact_id)
-        if provider_contact.archived or provider_contact.id != binding.hubspot_contact_id:
-            return _no_verified_contact()
-        identity_verified = await _verify_contact_identity(
-            operation_client,
-            binding,
-            provider_contact,
-        )
-        if identity_verified is not None:
-            return identity_verified
-        if not _settings_unchanged(settings, expected_key, expected_portal):
-            return _result(
-                BookingOutcome.NOT_CONFIGURED,
-                error_code=BookingOutcomeErrorCode.ACCOUNT_MISMATCH,
-                next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+        if isinstance(existing, _ExistingClaim) and existing.status is ToolExecutionStatus.STARTED:
+            return await _reconcile_existing_claim(
+                session_factory,
+                evidence,
+                existing,
+                binding,
+                settings,
+                expected_key=expected_key,
+                expected_portal=expected_portal,
+                client=clients.operation,
+                idempotency_key=idempotency_key,
             )
 
         second_validation = await validate_booking_evidence(
@@ -330,6 +389,24 @@ async def record_booking_outcome(
             idempotency_key=idempotency_key,
         )
         if isinstance(claim, BookingOutcomeResult):
+            if claim.outcome is BookingOutcome.UNCERTAIN:
+                latest = await _existing_claim(session_factory, idempotency_key, request)
+                if (
+                    isinstance(latest, _ExistingClaim)
+                    and latest.status is ToolExecutionStatus.STARTED
+                    and _claim_binding_matches(latest.sanitized_arguments, evidence, binding)
+                ):
+                    return await _reconcile_existing_claim(
+                        session_factory,
+                        evidence,
+                        latest,
+                        binding,
+                        settings,
+                        expected_key=expected_key,
+                        expected_portal=expected_portal,
+                        client=clients.operation,
+                        idempotency_key=idempotency_key,
+                    )
             return claim
 
         binding_unchanged = await _binding_is_current(
@@ -338,16 +415,6 @@ async def record_booking_outcome(
             binding,
             expected_portal_id=expected_portal,
         )
-        if not binding_unchanged or not _settings_unchanged(
-            settings, expected_key, expected_portal
-        ):
-            result = _result(
-                BookingOutcome.FAILED,
-                error_code=BookingOutcomeErrorCode.LOCAL_STATE_CHANGED,
-                next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
-            )
-            return await _persist_claim_result(session_factory, claim, evidence, result)
-
         final_validation = await validate_booking_evidence(
             session_factory,
             BookingEvidenceValidationRequest(
@@ -355,57 +422,48 @@ async def record_booking_outcome(
                 source_tool_execution_id=request.source_tool_execution_id,
             ),
         )
-        if final_validation.outcome is not BookingEvidenceValidationOutcome.VALID:
-            return await _persist_claim_result(
-                session_factory,
-                claim,
-                evidence,
-                _validation_failure(final_validation.outcome),
+        if (
+            not binding_unchanged
+            or not _settings_unchanged(settings, expected_key, expected_portal)
+            or final_validation.outcome is not BookingEvidenceValidationOutcome.VALID
+            or final_validation.evidence != evidence
+        ):
+            failure = (
+                _validation_failure(final_validation.outcome)
+                if final_validation.outcome is not BookingEvidenceValidationOutcome.VALID
+                else _result(
+                    BookingOutcome.FAILED,
+                    error_code=BookingOutcomeErrorCode.LOCAL_STATE_CHANGED,
+                    next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+                )
             )
-        if final_validation.evidence != evidence:
-            result = _result(
-                BookingOutcome.FAILED,
-                error_code=BookingOutcomeErrorCode.LOCAL_STATE_CHANGED,
-                next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
-            )
-            return await _persist_claim_result(session_factory, claim, evidence, result)
+            return await _persist_claim_result(session_factory, claim, evidence, failure)
 
-        note_body = _format_booking_note(evidence)
-        try:
-            created = await operation_client.create_note(
-                binding.hubspot_contact_id,
-                body=note_body,
-                timestamp=evidence.source_finished_at_utc,
-            )
-        except HubSpotProviderError as error:
-            result = _post_provider_failure(error)
-            return await _persist_claim_result(session_factory, claim, evidence, result)
-
-        verified_note = await _verify_created_note(
-            operation_client,
-            created,
-            expected_body=note_body,
-            expected_timestamp=evidence.source_finished_at_utc,
-            expected_contact_id=binding.hubspot_contact_id,
+        return await _write_new_note(
+            session_factory,
+            evidence,
+            claim,
+            binding,
+            settings,
+            expected_key=expected_key,
+            expected_portal=expected_portal,
+            client=clients.operation,
         )
-        if verified_note is None:
-            result = _result(
-                BookingOutcome.UNCERTAIN,
-                error_code=BookingOutcomeErrorCode.NOTE_IDENTITY_UNVERIFIED,
-                next_action=BookingOutcomeNextAction.RECONCILE_SAME_KEY,
-            )
-            return await _persist_claim_result(session_factory, claim, evidence, result)
-
-        result = _result(BookingOutcome.WRITTEN, note_id=verified_note.id)
-        return await _persist_claim_result(session_factory, claim, evidence, result)
     except HubSpotProviderError as error:
+        if isinstance(existing, _ExistingClaim) and existing.status is ToolExecutionStatus.STARTED:
+            return _uncertain_from_provider_error(error, replayed=True)
         return _prewrite_provider_failure(error)
     except SQLAlchemyError:
+        if isinstance(existing, _ExistingClaim) and existing.status is ToolExecutionStatus.STARTED:
+            return _result(
+                BookingOutcome.UNCERTAIN,
+                replayed=True,
+                error_code=BookingOutcomeErrorCode.LOCAL_PERSISTENCE_FAILURE,
+                next_action=BookingOutcomeNextAction.RECONCILE_SAME_KEY,
+            )
         return _local_persistence_failure()
     finally:
-        if operation_client is not None and operation_client is not preflight_client:
-            await operation_client.aclose()
-        await preflight_client.aclose()
+        await _close_hubspot_clients(clients)
 
 
 def _validation_failure(outcome: BookingEvidenceValidationOutcome) -> BookingOutcomeResult:
@@ -426,11 +484,658 @@ def _validation_failure(outcome: BookingEvidenceValidationOutcome) -> BookingOut
     )
 
 
-async def _existing_claim(
+def _uncertain_from_validation(
+    outcome: BookingEvidenceValidationOutcome,
+) -> BookingOutcomeResult:
+    failure = _validation_failure(outcome)
+    return _result(
+        BookingOutcome.UNCERTAIN,
+        error_code=failure.error_code or BookingOutcomeErrorCode.HISTORICAL_RESULT_MISMATCH,
+        next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+    )
+
+
+def _uncertain_from_prewrite_failure(failure: BookingOutcomeResult) -> BookingOutcomeResult:
+    return _result(
+        BookingOutcome.UNCERTAIN,
+        replayed=True,
+        error_code=failure.error_code or BookingOutcomeErrorCode.NOTE_IDENTITY_UNVERIFIED,
+        next_action=(
+            BookingOutcomeNextAction.OPERATOR_REVIEW
+            if failure.next_action is BookingOutcomeNextAction.OPERATOR_REVIEW
+            else BookingOutcomeNextAction.RECONCILE_SAME_KEY
+        ),
+    )
+
+
+def _uncertain_from_provider_error(
+    error: HubSpotProviderError,
+    *,
+    replayed: bool = False,
+) -> BookingOutcomeResult:
+    return _result(
+        BookingOutcome.UNCERTAIN,
+        replayed=replayed,
+        error_code=_provider_error_code(error.code),
+        next_action=BookingOutcomeNextAction.RECONCILE_SAME_KEY,
+    )
+
+
+async def _prepare_hubspot_clients(
+    settings: Settings,
+    transport: httpx.AsyncBaseTransport | None,
+    *,
+    expected_key: object,
+    expected_portal: str | None,
+) -> _HubSpotClients | BookingOutcomeResult:
+    try:
+        preflight_client = HubSpotClient(settings, transport=transport)
+    except HubSpotProviderError as error:
+        return _prewrite_provider_failure(error)
+    preflight = await preflight_client.preflight_account()
+    failure = _preflight_failure(preflight)
+    if failure is not None:
+        await preflight_client.aclose()
+        return failure
+    if not _settings_unchanged(settings, expected_key, expected_portal):
+        await preflight_client.aclose()
+        return _result(
+            BookingOutcome.NOT_CONFIGURED,
+            error_code=BookingOutcomeErrorCode.ACCOUNT_MISMATCH,
+            next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+        )
+    if preflight.writes_enabled:
+        return _HubSpotClients(preflight=preflight_client, operation=preflight_client)
+    isolated_test_transport = settings.app_env in {"test", "ci"} and isinstance(
+        transport, httpx.MockTransport
+    )
+    if not isolated_test_transport:
+        await preflight_client.aclose()
+        return _result(
+            BookingOutcome.NOT_CONFIGURED,
+            error_code=BookingOutcomeErrorCode.ACTIVATION_REQUIRED,
+            next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+        )
+    try:
+        operation_client = HubSpotClient(settings, transport=transport)
+    except HubSpotProviderError as error:
+        await preflight_client.aclose()
+        return _prewrite_provider_failure(error)
+    return _HubSpotClients(preflight=preflight_client, operation=operation_client)
+
+
+async def _close_hubspot_clients(clients: _HubSpotClients) -> None:
+    if clients.operation is not clients.preflight:
+        await clients.operation.aclose()
+    await clients.preflight.aclose()
+
+
+async def _verify_provider_contact(
+    client: HubSpotClient,
+    binding: _ContactBinding,
+) -> BookingOutcomeResult | None:
+    try:
+        provider_contact = await client.get_contact_by_id(binding.hubspot_contact_id)
+    except HubSpotProviderError as error:
+        if error.code is HubSpotErrorCode.NOT_FOUND:
+            return _no_verified_contact()
+        raise
+    if provider_contact.archived or provider_contact.id != binding.hubspot_contact_id:
+        return _no_verified_contact()
+    return await _verify_contact_identity(client, binding, provider_contact)
+
+
+async def _write_new_note(
     session_factory: async_sessionmaker[AsyncSession],
     evidence: BookingEvidence,
+    claim: ToolExecution,
+    binding: _ContactBinding,
+    settings: Settings,
+    *,
+    expected_key: object,
+    expected_portal: str | None,
+    client: HubSpotClient,
+) -> BookingOutcomeResult:
+    write_may_have_succeeded = False
+    verified_note_id: str | None = None
+    try:
+        async with session_factory.begin() as session:
+            locked_claim, result = await _lock_claim_context(
+                session_factory,
+                session,
+                evidence,
+                claim.id,
+                binding,
+                idempotency_key=_note_idempotency_key(evidence.source_tool_execution_id),
+                expected_portal_id=expected_portal,
+            )
+            if result is not None:
+                if locked_claim is not None and locked_claim.status is ToolExecutionStatus.STARTED:
+                    _terminalize_claim(session, locked_claim, result)
+                    session.add(_audit_event(evidence, result.outcome.value, result=result))
+                elif locked_claim is None and (
+                    result.error_code is BookingOutcomeErrorCode.OPERATION_IN_PROGRESS
+                ):
+                    current_claim = await session.scalar(
+                        select(ToolExecution).where(ToolExecution.id == claim.id).with_for_update()
+                    )
+                    if (
+                        current_claim is not None
+                        and current_claim.status is ToolExecutionStatus.STARTED
+                    ):
+                        retryable = _result(
+                            BookingOutcome.FAILED,
+                            error_code=BookingOutcomeErrorCode.OPERATION_IN_PROGRESS,
+                            next_action=BookingOutcomeNextAction.RETRY_SAME_KEY,
+                        )
+                        _terminalize_claim(session, current_claim, retryable)
+                        session.add(
+                            _audit_event(evidence, retryable.outcome.value, result=retryable)
+                        )
+                        return retryable
+                    if (
+                        current_claim is not None
+                        and current_claim.status is ToolExecutionStatus.SUCCEEDED
+                    ):
+                        return _replay_claim(current_claim)
+                return result
+            if locked_claim is None:
+                return _note_uncertain()
+            active_error = await _other_crm_mutation_exists(
+                session, evidence.contact_id, excluding_claim_id=claim.id
+            )
+            if active_error:
+                result = _result(
+                    BookingOutcome.FAILED,
+                    error_code=BookingOutcomeErrorCode.OPERATION_IN_PROGRESS,
+                    next_action=BookingOutcomeNextAction.RETRY_SAME_KEY,
+                )
+                _terminalize_claim(session, locked_claim, result)
+                session.add(_audit_event(evidence, result.outcome.value, result=result))
+                return result
+            latest = await validate_booking_evidence(
+                session_factory,
+                BookingEvidenceValidationRequest(
+                    booking_id=evidence.booking_id,
+                    source_tool_execution_id=evidence.source_tool_execution_id,
+                ),
+            )
+            if latest.outcome is not BookingEvidenceValidationOutcome.VALID:
+                result = _validation_failure(latest.outcome)
+                _terminalize_claim(session, locked_claim, result)
+                session.add(_audit_event(evidence, result.outcome.value, result=result))
+                return result
+            if latest.evidence != evidence:
+                result = _result(
+                    BookingOutcome.FAILED,
+                    error_code=BookingOutcomeErrorCode.LOCAL_STATE_CHANGED,
+                    next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+                )
+                _terminalize_claim(session, locked_claim, result)
+                session.add(_audit_event(evidence, result.outcome.value, result=result))
+                return result
+            if not _settings_unchanged(settings, expected_key, expected_portal):
+                result = _result(
+                    BookingOutcome.FAILED,
+                    error_code=BookingOutcomeErrorCode.ACCOUNT_MISMATCH,
+                    next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+                )
+                _terminalize_claim(session, locked_claim, result)
+                session.add(_audit_event(evidence, result.outcome.value, result=result))
+                return result
+            identity_failure = await _verify_provider_contact(client, binding)
+            if identity_failure is not None:
+                _terminalize_claim(session, locked_claim, identity_failure)
+                session.add(
+                    _audit_event(evidence, identity_failure.outcome.value, result=identity_failure)
+                )
+                return identity_failure
+            try:
+                write_may_have_succeeded = True
+                created = await client.create_note(
+                    binding.hubspot_contact_id,
+                    body=_format_booking_note(evidence),
+                    timestamp=evidence.source_finished_at_utc,
+                )
+            except HubSpotProviderError as error:
+                write_may_have_succeeded = error.outcome_uncertain
+                result = _post_provider_failure(error)
+            else:
+                result = await _verify_note_and_repair(
+                    client,
+                    created,
+                    evidence,
+                    binding,
+                    settings,
+                    expected_key=expected_key,
+                    expected_portal=expected_portal,
+                )
+            if result.outcome in {BookingOutcome.WRITTEN, BookingOutcome.REPLAYED}:
+                verified_note_id = result.hubspot_note_id
+            _terminalize_claim(session, locked_claim, result)
+            session.add(_audit_event(evidence, result.outcome.value, result=result))
+        return result
+    except SQLAlchemyError:
+        if write_may_have_succeeded:
+            return _result(
+                BookingOutcome.UNCERTAIN,
+                note_id=verified_note_id,
+                error_code=BookingOutcomeErrorCode.LOCAL_PERSISTENCE_FAILURE,
+                next_action=BookingOutcomeNextAction.RECONCILE_SAME_KEY,
+            )
+        return await _persist_claim_result(
+            session_factory,
+            claim,
+            evidence,
+            _local_persistence_failure(),
+        )
+
+
+async def _reconcile_existing_claim(
+    session_factory: async_sessionmaker[AsyncSession],
+    evidence: BookingEvidence,
+    existing: _ExistingClaim,
+    binding: _ContactBinding,
+    settings: Settings,
+    *,
+    expected_key: object,
+    expected_portal: str | None,
+    client: HubSpotClient,
     idempotency_key: str,
-) -> BookingOutcomeResult | None:
+) -> BookingOutcomeResult:
+    try:
+        async with session_factory.begin() as session:
+            claim, result = await _lock_claim_context(
+                session_factory,
+                session,
+                evidence,
+                existing.id,
+                binding,
+                idempotency_key=idempotency_key,
+                expected_portal_id=expected_portal,
+            )
+            if result is not None:
+                return result
+            if claim is None:
+                return _note_uncertain(replayed=True)
+            active_error = await _other_crm_mutation_exists(
+                session, evidence.contact_id, excluding_claim_id=existing.id
+            )
+            if active_error:
+                result = _result(
+                    BookingOutcome.UNCERTAIN,
+                    replayed=True,
+                    error_code=BookingOutcomeErrorCode.OPERATION_IN_PROGRESS,
+                    next_action=BookingOutcomeNextAction.RECONCILE_SAME_KEY,
+                )
+                _terminalize_claim(session, claim, result)
+                session.add(_audit_event(evidence, result.outcome.value, result=result))
+                return result
+            latest = await validate_booking_evidence(
+                session_factory,
+                BookingEvidenceValidationRequest(
+                    booking_id=evidence.booking_id,
+                    source_tool_execution_id=evidence.source_tool_execution_id,
+                ),
+            )
+            if latest.outcome is not BookingEvidenceValidationOutcome.VALID:
+                result = _uncertain_from_validation(latest.outcome)
+            elif latest.evidence != evidence:
+                result = _result(
+                    BookingOutcome.UNCERTAIN,
+                    replayed=True,
+                    error_code=BookingOutcomeErrorCode.CLAIM_BINDING_MISMATCH,
+                    next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+                )
+            elif not _settings_unchanged(settings, expected_key, expected_portal):
+                result = _result(
+                    BookingOutcome.UNCERTAIN,
+                    replayed=True,
+                    error_code=BookingOutcomeErrorCode.ACCOUNT_MISMATCH,
+                    next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+                )
+            else:
+                identity_failure = await _verify_provider_contact(client, binding)
+                if identity_failure is not None:
+                    result = _result(
+                        BookingOutcome.UNCERTAIN,
+                        replayed=True,
+                        error_code=BookingOutcomeErrorCode.CLAIM_BINDING_MISMATCH,
+                        next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+                    )
+                else:
+                    result = await _reconcile_note(
+                        client,
+                        evidence,
+                        binding,
+                        settings,
+                        expected_key=expected_key,
+                        expected_portal=expected_portal,
+                    )
+            _terminalize_claim(session, claim, result)
+            session.add(_audit_event(evidence, result.outcome.value, result=result))
+        return result
+    except SQLAlchemyError:
+        return _result(
+            BookingOutcome.UNCERTAIN,
+            replayed=True,
+            error_code=BookingOutcomeErrorCode.LOCAL_PERSISTENCE_FAILURE,
+            next_action=BookingOutcomeNextAction.RECONCILE_SAME_KEY,
+        )
+
+
+async def _reconcile_note(
+    client: HubSpotClient,
+    evidence: BookingEvidence,
+    binding: _ContactBinding,
+    settings: Settings,
+    *,
+    expected_key: object,
+    expected_portal: str | None,
+) -> BookingOutcomeResult:
+    try:
+        search = await client.search_notes(
+            _source_operation_marker(evidence.source_tool_execution_id)
+        )
+    except HubSpotProviderError as error:
+        return _uncertain_from_provider_error(error, replayed=True)
+    if not search.complete:
+        return _result(
+            BookingOutcome.UNCERTAIN,
+            replayed=True,
+            error_code=BookingOutcomeErrorCode.NOTE_SEARCH_INCOMPLETE,
+            next_action=BookingOutcomeNextAction.RECONCILE_SAME_KEY,
+        )
+    marker_line = f"Source operation: {_source_operation_marker(evidence.source_tool_execution_id)}"
+    exact_marker_notes: list[HubSpotNoteSnapshot] = []
+    inspected_ids: set[str] = set()
+    try:
+        for search_result in search.results:
+            if search_result.id in inspected_ids:
+                continue
+            inspected_ids.add(search_result.id)
+            candidate = await client.get_note(search_result.id)
+            if candidate.id != search_result.id:
+                return _note_uncertain(replayed=True)
+            if candidate.body is not None and marker_line in candidate.body.splitlines():
+                exact_marker_notes.append(candidate)
+    except HubSpotProviderError as error:
+        return _uncertain_from_provider_error(error, replayed=True)
+    if len(exact_marker_notes) > 1:
+        return _result(
+            BookingOutcome.UNCERTAIN,
+            replayed=True,
+            error_code=BookingOutcomeErrorCode.NOTE_SEARCH_AMBIGUOUS,
+            next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+        )
+    if not exact_marker_notes:
+        return _note_uncertain(replayed=True)
+    if not _note_core_is_verified(
+        exact_marker_notes[0],
+        expected_body=_format_booking_note(evidence),
+        expected_timestamp=evidence.source_finished_at_utc,
+    ):
+        return _note_uncertain(replayed=True)
+    return await _verify_association_or_repair(
+        client,
+        exact_marker_notes[0],
+        evidence,
+        binding,
+        settings,
+        expected_key=expected_key,
+        expected_portal=expected_portal,
+        replayed=True,
+    )
+
+
+async def _verify_note_and_repair(
+    client: HubSpotClient,
+    created: HubSpotNoteSnapshot,
+    evidence: BookingEvidence,
+    binding: _ContactBinding,
+    settings: Settings,
+    *,
+    expected_key: object,
+    expected_portal: str | None,
+) -> BookingOutcomeResult:
+    if not _valid_provider_id(created.id):
+        return _note_uncertain()
+    candidate = created
+    if (
+        not _note_core_is_verified(
+            candidate,
+            expected_body=_format_booking_note(evidence),
+            expected_timestamp=evidence.source_finished_at_utc,
+        )
+        or not candidate.contact_associations_complete
+    ):
+        try:
+            candidate = await client.get_note(created.id)
+        except HubSpotProviderError as error:
+            return _uncertain_from_provider_error(error)
+    if candidate.id != created.id or not _note_core_is_verified(
+        candidate,
+        expected_body=_format_booking_note(evidence),
+        expected_timestamp=evidence.source_finished_at_utc,
+    ):
+        return _note_uncertain()
+    return await _verify_association_or_repair(
+        client,
+        candidate,
+        evidence,
+        binding,
+        settings,
+        expected_key=expected_key,
+        expected_portal=expected_portal,
+        replayed=False,
+    )
+
+
+async def _verify_association_or_repair(
+    client: HubSpotClient,
+    note: HubSpotNoteSnapshot,
+    evidence: BookingEvidence,
+    binding: _ContactBinding,
+    settings: Settings,
+    *,
+    expected_key: object,
+    expected_portal: str | None,
+    replayed: bool,
+) -> BookingOutcomeResult:
+    if not note.contact_associations_complete:
+        return _note_uncertain(replayed=replayed)
+    if note.contact_ids == (binding.hubspot_contact_id,):
+        return _result(
+            BookingOutcome.REPLAYED if replayed else BookingOutcome.WRITTEN,
+            note_id=note.id,
+            replayed=replayed,
+        )
+    if note.contact_ids:
+        return _result(
+            BookingOutcome.UNCERTAIN,
+            replayed=replayed,
+            error_code=BookingOutcomeErrorCode.NOTE_ASSOCIATION_CONFLICT,
+            next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+        )
+    if not _settings_unchanged(settings, expected_key, expected_portal):
+        return _result(
+            BookingOutcome.UNCERTAIN,
+            replayed=replayed,
+            error_code=BookingOutcomeErrorCode.ACCOUNT_MISMATCH,
+            next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+        )
+    try:
+        repaired = await client.ensure_note_contact_association(
+            note.id,
+            binding.hubspot_contact_id,
+            expected_body=_format_booking_note(evidence),
+            expected_timestamp=evidence.source_finished_at_utc,
+        )
+    except HubSpotProviderError as error:
+        code = (
+            BookingOutcomeErrorCode.NOTE_ASSOCIATION_CONFLICT
+            if error.code is HubSpotErrorCode.CONFLICT
+            else _provider_error_code(error.code)
+        )
+        return _result(
+            BookingOutcome.UNCERTAIN,
+            replayed=replayed,
+            error_code=code,
+            next_action=(
+                BookingOutcomeNextAction.OPERATOR_REVIEW
+                if code is BookingOutcomeErrorCode.NOTE_ASSOCIATION_CONFLICT
+                else BookingOutcomeNextAction.RECONCILE_SAME_KEY
+            ),
+        )
+    if (
+        repaired.id != note.id
+        or not _note_core_is_verified(
+            repaired,
+            expected_body=_format_booking_note(evidence),
+            expected_timestamp=evidence.source_finished_at_utc,
+        )
+        or not repaired.contact_associations_complete
+        or repaired.contact_ids != (binding.hubspot_contact_id,)
+    ):
+        return _result(
+            BookingOutcome.UNCERTAIN,
+            replayed=replayed,
+            error_code=BookingOutcomeErrorCode.NOTE_ASSOCIATION_CONFLICT,
+            next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+        )
+    return _result(
+        BookingOutcome.REPLAYED if replayed else BookingOutcome.WRITTEN,
+        note_id=note.id,
+        replayed=replayed,
+    )
+
+
+def _note_uncertain(*, replayed: bool = False) -> BookingOutcomeResult:
+    return _result(
+        BookingOutcome.UNCERTAIN,
+        replayed=replayed,
+        error_code=BookingOutcomeErrorCode.NOTE_IDENTITY_UNVERIFIED,
+        next_action=BookingOutcomeNextAction.RECONCILE_SAME_KEY,
+    )
+
+
+async def _lock_claim_context(
+    session_factory: async_sessionmaker[AsyncSession],
+    session: AsyncSession,
+    evidence: BookingEvidence,
+    claim_id: UUID,
+    binding: _ContactBinding,
+    *,
+    idempotency_key: str,
+    expected_portal_id: str | None,
+) -> tuple[ToolExecution | None, BookingOutcomeResult | None]:
+    contact = await session.scalar(
+        select(Contact).where(Contact.id == evidence.contact_id).with_for_update(skip_locked=True)
+    )
+    if contact is None:
+        return None, _result(
+            BookingOutcome.UNCERTAIN,
+            replayed=True,
+            error_code=BookingOutcomeErrorCode.OPERATION_IN_PROGRESS,
+            next_action=BookingOutcomeNextAction.RECONCILE_SAME_KEY,
+        )
+    conversation = await session.scalar(
+        select(Conversation).where(Conversation.id == evidence.conversation_id).with_for_update()
+    )
+    booking = await session.scalar(
+        select(Booking).where(Booking.id == evidence.booking_id).with_for_update()
+    )
+    link = await session.scalar(
+        select(CRMContactLink)
+        .where(CRMContactLink.contact_id == evidence.contact_id)
+        .with_for_update()
+    )
+    source = await session.scalar(
+        select(ToolExecution)
+        .where(ToolExecution.id == evidence.source_tool_execution_id)
+        .with_for_update()
+    )
+    claim = await session.scalar(
+        select(ToolExecution).where(ToolExecution.id == claim_id).with_for_update()
+    )
+    region = await session.scalar(
+        select(BusinessConfig.default_phone_region).where(BusinessConfig.id == 1)
+    )
+    if claim is None:
+        return None, _result(
+            BookingOutcome.UNCERTAIN,
+            replayed=True,
+            error_code=BookingOutcomeErrorCode.LOCAL_PERSISTENCE_FAILURE,
+            next_action=BookingOutcomeNextAction.RECONCILE_SAME_KEY,
+        )
+    if claim.status is ToolExecutionStatus.SUCCEEDED:
+        return None, _replay_claim(claim)
+    if claim.status is not ToolExecutionStatus.STARTED:
+        try:
+            prior = BookingOutcomeResult.model_validate(claim.sanitized_result)
+        except (TypeError, ValueError):
+            return None, _note_uncertain(replayed=True)
+        return None, prior.model_copy(update={"replayed": True})
+    if (
+        claim.tool_name != _OPERATION
+        or claim.idempotency_key != idempotency_key
+        or claim.conversation_id != evidence.conversation_id
+        or not _claim_binding_matches(claim.sanitized_arguments, evidence, binding)
+        or source is None
+        or contact is None
+        or conversation is None
+        or booking is None
+        or conversation.contact_id != evidence.contact_id
+        or booking.contact_id != evidence.contact_id
+        or link is None
+        or link.state is not CRMContactLinkState.ACTIVE
+        or link.hubspot_portal_id != expected_portal_id
+        or link.hubspot_contact_id != binding.hubspot_contact_id
+        or link.linked_by is not binding.linked_by
+        or contact.phone_e164 != binding.phone_e164
+        or region != binding.default_phone_region
+        or (
+            binding.linked_by is CRMContactLinkProvenance.VERIFIED_EMAIL
+            and _normalize_email(contact.email) != binding.verified_email
+        )
+    ):
+        return None, _result(
+            BookingOutcome.UNCERTAIN,
+            replayed=True,
+            error_code=BookingOutcomeErrorCode.CLAIM_BINDING_MISMATCH,
+            next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+        )
+    return claim, None
+
+
+async def _other_crm_mutation_exists(
+    session: AsyncSession,
+    contact_id: UUID,
+    *,
+    excluding_claim_id: UUID,
+) -> bool:
+    return (
+        await session.scalar(
+            select(ToolExecution.id)
+            .where(
+                ToolExecution.conversation_id.in_(
+                    select(Conversation.id).where(Conversation.contact_id == contact_id)
+                ),
+                ToolExecution.tool_name.in_(_CRM_MUTATIONS),
+                ToolExecution.status == ToolExecutionStatus.STARTED,
+                ToolExecution.id != excluding_claim_id,
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
+async def _existing_claim(
+    session_factory: async_sessionmaker[AsyncSession],
+    idempotency_key: str,
+    request: BookingOutcomeRequest,
+) -> _ExistingClaim | BookingOutcomeResult | None:
     try:
         async with session_factory() as session:
             execution = await session.scalar(
@@ -440,39 +1145,55 @@ async def _existing_claim(
         return _local_persistence_failure()
     if execution is None:
         return None
-    if execution.tool_name != _OPERATION or execution.conversation_id != evidence.conversation_id:
-        return _result(
-            BookingOutcome.FAILED,
-            replayed=True,
-            error_code=BookingOutcomeErrorCode.IDEMPOTENCY_CONFLICT,
-            next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
-        )
     arguments = execution.sanitized_arguments
-    if not isinstance(arguments, Mapping) or not _source_binding_matches(arguments, evidence):
+    if (
+        execution.tool_name != _OPERATION
+        or not isinstance(arguments, Mapping)
+        or arguments.get("source_tool_execution_id") != str(request.source_tool_execution_id)
+        or arguments.get("booking_id") != str(request.booking_id)
+    ):
         return _result(
             BookingOutcome.FAILED,
             replayed=True,
             error_code=BookingOutcomeErrorCode.IDEMPOTENCY_CONFLICT,
             next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
         )
-    if execution.status is ToolExecutionStatus.STARTED:
+    stored = execution.sanitized_result
+    if execution.status is ToolExecutionStatus.SUCCEEDED:
+        try:
+            prior = BookingOutcomeResult.model_validate(stored)
+        except (TypeError, ValueError):
+            return _result(
+                BookingOutcome.UNCERTAIN,
+                replayed=True,
+                error_code=BookingOutcomeErrorCode.NOTE_IDENTITY_UNVERIFIED,
+                next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
+            )
+        if prior.outcome in {BookingOutcome.WRITTEN, BookingOutcome.REPLAYED} and (
+            prior.hubspot_note_id is not None
+        ):
+            return _result(
+                BookingOutcome.REPLAYED,
+                note_id=prior.hubspot_note_id,
+                replayed=True,
+            )
         return _result(
             BookingOutcome.UNCERTAIN,
             replayed=True,
             error_code=BookingOutcomeErrorCode.NOTE_IDENTITY_UNVERIFIED,
-            next_action=BookingOutcomeNextAction.RECONCILE_SAME_KEY,
+            next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
         )
-    stored = execution.sanitized_result
-    if isinstance(stored, Mapping):
-        code = stored.get("error_code")
-        action = stored.get("next_action")
-        if (
-            execution.status is ToolExecutionStatus.FAILED
-            and stored.get("outcome") == BookingOutcome.FAILED.value
-            and code == BookingOutcomeErrorCode.PROVIDER_UNAVAILABLE.value
-            and action == BookingOutcomeNextAction.RETRY_SAME_KEY.value
-        ):
-            return None
+    if execution.status is ToolExecutionStatus.STARTED or (
+        execution.status is ToolExecutionStatus.FAILED and _known_no_write_retry(stored)
+    ):
+        return _ExistingClaim(
+            id=execution.id,
+            tool_name=execution.tool_name,
+            conversation_id=execution.conversation_id,
+            status=execution.status,
+            sanitized_arguments=dict(arguments),
+            sanitized_result=stored,
+        )
     try:
         prior = BookingOutcomeResult.model_validate(stored)
     except (TypeError, ValueError):
@@ -482,50 +1203,22 @@ async def _existing_claim(
             error_code=BookingOutcomeErrorCode.NOTE_IDENTITY_UNVERIFIED,
             next_action=BookingOutcomeNextAction.RECONCILE_SAME_KEY,
         )
-    if (
-        execution.status is ToolExecutionStatus.SUCCEEDED
-        and prior.outcome is BookingOutcome.WRITTEN
-    ):
-        return _result(
-            BookingOutcome.REPLAYED,
-            note_id=prior.hubspot_note_id,
-            replayed=True,
-        )
     if execution.status is ToolExecutionStatus.FAILED and prior.outcome is BookingOutcome.FAILED:
         return prior.model_copy(update={"replayed": True})
     return _result(
-        BookingOutcome.UNCERTAIN,
+        BookingOutcome.FAILED,
         replayed=True,
         error_code=BookingOutcomeErrorCode.NOTE_IDENTITY_UNVERIFIED,
-        next_action=BookingOutcomeNextAction.RECONCILE_SAME_KEY,
+        next_action=BookingOutcomeNextAction.OPERATOR_REVIEW,
     )
 
 
-def _source_binding_matches(arguments: Mapping[str, object], evidence: BookingEvidence) -> bool:
-    expected = {
-        "source_tool_execution_id": str(evidence.source_tool_execution_id),
-        "booking_id": str(evidence.booking_id),
-        "contact_id": str(evidence.contact_id),
-        "conversation_id": str(evidence.conversation_id),
-        "operation_type": _OPERATION,
-        "historical_action": evidence.action.value,
-        "historical_status": evidence.historical_status.value,
-        "requested_start_at_utc": (
-            None
-            if evidence.requested_start_at_utc is None
-            else _utc_iso(evidence.requested_start_at_utc)
-        ),
-        "requested_end_at_utc": (
-            None
-            if evidence.requested_end_at_utc is None
-            else _utc_iso(evidence.requested_end_at_utc)
-        ),
-        "source_finished_at_utc": _utc_iso(evidence.source_finished_at_utc),
-        "source_marker": _source_operation_marker(evidence.source_tool_execution_id),
-    }
-    return all(arguments.get(key) == value for key, value in expected.items()) and bool(
-        arguments.get("hubspot_portal_id") and arguments.get("hubspot_contact_id")
-    )
+def _claim_binding_matches(
+    arguments: object,
+    evidence: BookingEvidence,
+    binding: _ContactBinding,
+) -> bool:
+    return isinstance(arguments, Mapping) and dict(arguments) == _claim_arguments(evidence, binding)
 
 
 async def _load_contact_binding(
@@ -774,7 +1467,7 @@ async def _create_claim(
                 execution = claim.execution
             elif claim.outcome is ToolExecutionClaimOutcome.FAILED_REPLAY:
                 stored = claim.execution.sanitized_result
-                if not _known_no_write_rate_limit(stored):
+                if not _known_no_write_retry(stored):
                     return _replay_claim(claim.execution)
                 execution = claim.execution
                 execution.status = ToolExecutionStatus.STARTED
@@ -790,11 +1483,16 @@ async def _create_claim(
         return _local_persistence_failure()
 
 
-def _known_no_write_rate_limit(stored: object) -> bool:
+def _known_no_write_retry(stored: object) -> bool:
     return (
         isinstance(stored, Mapping)
         and stored.get("outcome") == BookingOutcome.FAILED.value
-        and stored.get("error_code") == BookingOutcomeErrorCode.PROVIDER_UNAVAILABLE.value
+        and stored.get("error_code")
+        in {
+            BookingOutcomeErrorCode.PROVIDER_UNAVAILABLE.value,
+            BookingOutcomeErrorCode.OPERATION_IN_PROGRESS.value,
+            BookingOutcomeErrorCode.LOCAL_PERSISTENCE_FAILURE.value,
+        }
         and stored.get("next_action") == BookingOutcomeNextAction.RETRY_SAME_KEY.value
     )
 
@@ -816,10 +1514,10 @@ def _replay_claim(execution: ToolExecution) -> BookingOutcomeResult:
             error_code=BookingOutcomeErrorCode.NOTE_IDENTITY_UNVERIFIED,
             next_action=BookingOutcomeNextAction.RECONCILE_SAME_KEY,
         )
-    if (
-        execution.status is ToolExecutionStatus.SUCCEEDED
-        and prior.outcome is BookingOutcome.WRITTEN
-    ):
+    if execution.status is ToolExecutionStatus.SUCCEEDED and prior.outcome in {
+        BookingOutcome.WRITTEN,
+        BookingOutcome.REPLAYED,
+    }:
         return _result(
             BookingOutcome.REPLAYED,
             note_id=prior.hubspot_note_id,
@@ -828,48 +1526,17 @@ def _replay_claim(execution: ToolExecution) -> BookingOutcomeResult:
     return prior.model_copy(update={"replayed": True})
 
 
-async def _verify_created_note(
-    client: HubSpotClient,
-    created: HubSpotNoteSnapshot,
-    *,
-    expected_body: str,
-    expected_timestamp: datetime,
-    expected_contact_id: str,
-) -> HubSpotNoteSnapshot | None:
-    candidate = created
-    if not _note_is_verified(
-        candidate,
-        expected_body=expected_body,
-        expected_timestamp=expected_timestamp,
-        expected_contact_id=expected_contact_id,
-    ):
-        try:
-            candidate = await client.get_note(created.id)
-        except HubSpotProviderError:
-            return None
-    if not _note_is_verified(
-        candidate,
-        expected_body=expected_body,
-        expected_timestamp=expected_timestamp,
-        expected_contact_id=expected_contact_id,
-    ):
-        return None
-    return candidate
-
-
-def _note_is_verified(
+def _note_core_is_verified(
     note: HubSpotNoteSnapshot,
     *,
     expected_body: str,
     expected_timestamp: datetime,
-    expected_contact_id: str,
 ) -> bool:
     if (
         not _valid_provider_id(note.id)
         or note.archived
         or note.body != expected_body
         or note.timestamp is None
-        or note.contact_ids != (expected_contact_id,)
     ):
         return False
     timestamp = _parse_aware_timestamp(note.timestamp)
@@ -1019,7 +1686,7 @@ async def _persist_claim_result(
             _terminalize_claim(session, execution, result)
             session.add(_audit_event(evidence, result.outcome.value, result=result))
     except SQLAlchemyError:
-        if result.outcome is BookingOutcome.WRITTEN:
+        if result.outcome in {BookingOutcome.WRITTEN, BookingOutcome.REPLAYED}:
             return _result(
                 BookingOutcome.UNCERTAIN,
                 note_id=result.hubspot_note_id,
@@ -1047,7 +1714,7 @@ def _terminalize_claim(
     execution.safe_error_message = (
         None if result.error_code is None else _safe_error_message(result.error_code)
     )
-    if result.outcome is BookingOutcome.WRITTEN:
+    if result.outcome in {BookingOutcome.WRITTEN, BookingOutcome.REPLAYED}:
         execution.status = ToolExecutionStatus.SUCCEEDED
         execution.finished_at = datetime.now(UTC)
     elif result.outcome is BookingOutcome.UNCERTAIN:
