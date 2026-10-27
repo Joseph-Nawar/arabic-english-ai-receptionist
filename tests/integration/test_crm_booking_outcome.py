@@ -13,7 +13,19 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
-from receptionist.application.booking import ConfirmationData, ConfirmationResult
+from receptionist.application.booking import (
+    CancelBookingRequest,
+    ConfirmationData,
+    ConfirmationResult,
+    ConfirmBookingActionRequest,
+    CreateBookingRequest,
+    PreparationResult,
+    RescheduleBookingRequest,
+    confirm_booking_action,
+    prepare_cancel_booking,
+    prepare_create_booking,
+    prepare_reschedule_booking,
+)
 from receptionist.application.crm_booking_outcome import (
     BookingOutcome,
     BookingOutcomeErrorCode,
@@ -38,10 +50,12 @@ from receptionist.domain.enums import (
     ConversationChannel,
     ConversationLanguageMode,
     ConversationStatus,
+    PendingActionType,
     ToolExecutionStatus,
 )
 from receptionist.domain.identity import CRMContactLinkProvenance
 from receptionist.seed import seed_reference_data
+from tests.support.calendar_double import DeterministicCalendarDouble
 
 pytestmark = pytest.mark.integration
 
@@ -1455,6 +1469,243 @@ async def test_fully_verified_post_skips_reconciliation_and_association_repair(
     assert result.outcome is BookingOutcome.WRITTEN
     assert all("/notes/search" not in request.url.path for request in provider.requests)
     assert all("/associations/contact/" not in request.url.path for request in provider.requests)
+
+
+async def test_real_booking_history_notes_replay_out_of_order_without_calendar_mutation(
+    session_factory,
+) -> None:
+    now_create = datetime(2026, 10, 11, 3, tzinfo=UTC)
+    now_reschedule = now_create + timedelta(hours=1)
+    now_cancel = now_create + timedelta(hours=2)
+    first_start = datetime(2026, 10, 11, 5, 30, tzinfo=UTC)
+    first_end = datetime(2026, 10, 11, 6, 30, tzinfo=UTC)
+    second_start = first_start + timedelta(days=1)
+    second_end = first_end + timedelta(days=1)
+    calendar = DeterministicCalendarDouble(calendar_id="crm-history-calendar")
+
+    async with session_factory.begin() as session:
+        await seed_reference_data(session, "test")
+        service = await session.scalar(select(Service).where(Service.code == "plumbing"))
+        assert service is not None
+        service.active = True
+        service.bookable = True
+        service.booking_requirements = []
+        contact = Contact(phone_e164=f"+96650{uuid.uuid4().int % 10_000_000:07d}")
+        session.add(contact)
+        await session.flush()
+        conversation = Conversation(
+            contact_id=contact.id,
+            channel=ConversationChannel.PHONE,
+            status=ConversationStatus.OPEN,
+            control_mode=ControlMode.AI,
+            language_mode=ConversationLanguageMode.UNKNOWN,
+        )
+        session.add(conversation)
+        await session.flush()
+        contact_id = contact.id
+        conversation_id = conversation.id
+
+    create_preparation = await prepare_create_booking(
+        session_factory,
+        calendar,
+        CreateBookingRequest(
+            conversation_id=conversation_id,
+            service_selector="plumbing",
+            service_area_selector="al_olaya",
+            requested_start_at=first_start,
+            requested_end_at=first_end,
+            idempotency_key=f"history-prepare-create-{uuid.uuid4()}",
+        ),
+        now_utc=now_create,
+    )
+    assert isinstance(create_preparation, PreparationResult)
+    create_key = f"history-confirm-create-{uuid.uuid4()}"
+    create_result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=PendingActionType.CREATE_BOOKING,
+            action_token=create_preparation.data.action_token,
+            idempotency_key=create_key,
+        ),
+        now_utc=now_create,
+    )
+    assert isinstance(create_result, ConfirmationResult)
+    booking_id = create_result.data.booking_id
+
+    reschedule_preparation = await prepare_reschedule_booking(
+        session_factory,
+        calendar,
+        RescheduleBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            requested_start_at=second_start,
+            idempotency_key=f"history-prepare-reschedule-{uuid.uuid4()}",
+        ),
+        now_utc=now_reschedule,
+    )
+    assert isinstance(reschedule_preparation, PreparationResult)
+    reschedule_key = f"history-confirm-reschedule-{uuid.uuid4()}"
+    reschedule_result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=PendingActionType.RESCHEDULE_BOOKING,
+            action_token=reschedule_preparation.data.action_token,
+            idempotency_key=reschedule_key,
+        ),
+        now_utc=now_reschedule,
+    )
+    assert isinstance(reschedule_result, ConfirmationResult)
+
+    cancel_preparation = await prepare_cancel_booking(
+        session_factory,
+        CancelBookingRequest(
+            conversation_id=conversation_id,
+            booking_id=booking_id,
+            idempotency_key=f"history-prepare-cancel-{uuid.uuid4()}",
+        ),
+    )
+    assert isinstance(cancel_preparation, PreparationResult)
+    cancel_key = f"history-confirm-cancel-{uuid.uuid4()}"
+    cancel_result = await confirm_booking_action(
+        session_factory,
+        calendar,
+        ConfirmBookingActionRequest(
+            conversation_id=conversation_id,
+            action_type=PendingActionType.CANCEL_BOOKING,
+            action_token=cancel_preparation.data.action_token,
+            idempotency_key=cancel_key,
+        ),
+        now_utc=now_cancel,
+    )
+    assert isinstance(cancel_result, ConfirmationResult)
+    assert create_result.data.status is BookingStatus.CONFIRMED
+    assert reschedule_result.data.status is BookingStatus.CONFIRMED
+    assert cancel_result.data.status is BookingStatus.CANCELLED
+    assert calendar.mutation_calls == [
+        ("create", "crm-history-calendar", create_result.data.calendar_event_id),
+        ("patch", "crm-history-calendar", create_result.data.calendar_event_id),
+        ("cancel", "crm-history-calendar", create_result.data.calendar_event_id),
+    ]
+
+    source_by_action: dict[str, Source] = {}
+    for action, confirmation_key in (
+        ("create_booking", create_key),
+        ("reschedule_booking", reschedule_key),
+        ("cancel_booking", cancel_key),
+    ):
+        async with session_factory() as session:
+            execution = await session.scalar(
+                select(ToolExecution).where(ToolExecution.idempotency_key == confirmation_key)
+            )
+            contact = await session.get(Contact, contact_id)
+            booking = await session.get(Booking, booking_id)
+            assert execution is not None and execution.status is ToolExecutionStatus.SUCCEEDED
+            assert execution.finished_at is not None
+            assert contact is not None and booking is not None
+            source_by_action[action] = Source(
+                booking_id=booking_id,
+                source_id=execution.id,
+                conversation_id=conversation_id,
+                contact_id=contact_id,
+                service_id=booking.service_id,
+            )
+            local_phone = contact.phone_e164
+    assert local_phone is not None
+
+    provider = MockHubSpot(email=None, phone=local_phone)
+    async with session_factory.begin() as session:
+        session.add(
+            CRMContactLink(
+                contact_id=contact_id,
+                hubspot_portal_id=PORTAL_ID,
+                hubspot_contact_id=provider.contact_id,
+                linked_by=CRMContactLinkProvenance.PHONE_E164,
+                state=CRMContactLinkState.ACTIVE,
+            )
+        )
+
+    # A HubSpot outage cannot roll back or reverse the completed Calendar cancellation.
+    provider.account_status = 503
+    unavailable = await _run(session_factory, source_by_action["cancel_booking"], provider)
+    assert unavailable.outcome is BookingOutcome.FAILED
+    assert provider.note_create_count == 0
+    async with session_factory() as session:
+        current_booking = await session.get(Booking, booking_id)
+        assert current_booking is not None
+        assert current_booking.status is BookingStatus.CANCELLED
+        assert current_booking.start_at == second_start
+        assert current_booking.end_at == second_end
+    assert (
+        await calendar.get_event("crm-history-calendar", create_result.data.calendar_event_id)
+        is None
+    )
+    provider.account_status = 200
+
+    # Delivery order differs from booking order; every source retains its own history.
+    delivery_order = ("reschedule_booking", "create_booking", "cancel_booking")
+    delivered: dict[str, object] = {}
+    for action in delivery_order:
+        source = source_by_action[action]
+        result = await _run(session_factory, source, provider)
+        assert result.outcome is BookingOutcome.WRITTEN
+        delivered[action] = result
+
+    expected_slots = {
+        "create_booking": (first_start, first_end, "confirmed"),
+        "reschedule_booking": (second_start, second_end, "confirmed"),
+        "cancel_booking": (second_start, second_end, "cancelled"),
+    }
+    for action, source in source_by_action.items():
+        result = delivered[action]
+        note = provider.saved_notes[result.hubspot_note_id]
+        properties = note["properties"]
+        async with session_factory() as session:
+            execution = await session.get(ToolExecution, source.source_id)
+            assert execution is not None and execution.finished_at is not None
+            historical = ConfirmationResult.model_validate(execution.sanitized_result)
+        start_at, end_at, status = expected_slots[action]
+        start_text = start_at.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        end_text = end_at.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        expected_body = (
+            f"Booking operation: {action}\n"
+            f"Outcome: {status}\n"
+            f"Booking reference: {booking_id}\n"
+            f"Requested start (UTC): {start_text}\n"
+            f"Requested end (UTC): {end_text}\n"
+            f"Source operation: booking-execution:{source.source_id}"
+        )
+        assert historical.data.booking_id == booking_id
+        assert historical.data.requested_start_at_utc == start_at
+        assert historical.data.requested_end_at_utc == end_at
+        assert properties["hs_note_body"] == expected_body
+        assert properties["hs_timestamp"] == (
+            execution.finished_at.astimezone(UTC)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+
+    assert len(provider.saved_notes) == 3
+    first_write_count = provider.note_create_count
+    for action in delivery_order:
+        replay = await _run(session_factory, source_by_action[action], provider)
+        assert replay.outcome is BookingOutcome.REPLAYED
+        assert replay.replayed is True
+    assert provider.note_create_count == first_write_count == 3
+    assert calendar.mutation_calls == [
+        ("create", "crm-history-calendar", create_result.data.calendar_event_id),
+        ("patch", "crm-history-calendar", create_result.data.calendar_event_id),
+        ("cancel", "crm-history-calendar", create_result.data.calendar_event_id),
+    ]
+    async with session_factory() as session:
+        current_booking = await session.get(Booking, booking_id)
+        assert current_booking is not None
+        assert current_booking.status is BookingStatus.CANCELLED
+        assert current_booking.start_at == second_start
+        assert current_booking.end_at == second_end
 
 
 @pytest.mark.parametrize(
