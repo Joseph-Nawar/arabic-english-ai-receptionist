@@ -387,6 +387,34 @@ async def test_smoke_activation_is_limited_to_one_exact_synthetic_contact(monkey
     assert sum(request.method == "POST" for request in requests) == 1
 
 
+@pytest.mark.parametrize("changed_setting", ["hubspot_service_key", "hubspot_portal_id"])
+@pytest.mark.asyncio
+async def test_smoke_activation_is_invalidated_by_key_rotation_or_portal_change(
+    monkeypatch, changed_setting: str
+) -> None:
+    from pydantic import SecretStr
+
+    configuration = _configuration(monkeypatch)
+    client, requests, _ = _mock_provider(configuration)
+    run_email = smoke._synthetic_contact_email(uuid.UUID("e90c69bd-d7d5-4624-b55b-eefc175f3b1d"))
+
+    async with client:
+        assert (await client.preflight_account()).account_identity_verified
+        client._activate_guarded_smoke_writes(
+            portal_id=PORTAL_ID,
+            capability_confirmation=smoke.HUBSPOT_SMOKE_CAPABILITY_CONFIRMATION,
+            contact_email=run_email,
+        )
+        if changed_setting == "hubspot_service_key":
+            configuration.settings.hubspot_service_key = SecretStr("rotated-service-key")
+        else:
+            configuration.settings.hubspot_portal_id = "654321"
+        with pytest.raises(smoke.HubSpotProviderError):
+            await client.create_contact(email=run_email)
+
+    assert [request.method for request in requests] == ["GET"]
+
+
 @pytest.mark.asyncio
 async def test_production_client_cannot_enable_manual_smoke_writes(monkeypatch) -> None:
     configuration = _configuration(monkeypatch)
