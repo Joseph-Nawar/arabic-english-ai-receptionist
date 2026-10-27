@@ -18,4 +18,4 @@ This is the approved 13-phase roadmap for the Arabic-English AI Receptionist & C
 | 11 | Multilingual System Evaluation & Release Gates | `NOT STARTED` |
 | 12 | Portfolio & Freelance Release | `NOT STARTED` |
 
-Phase 0 was independently reviewed and approved as `COMPLETE`. Phase 1 was completed after independent review and remediation and is now `COMPLETE`. Phase 2 was completed following independent technical review, remediation, and repository-owner approval. Phase 3 implementation is submitted for independent review; no Phase 3 milestone is marked `COMPLETE` by the implementation agent. Phases 4–12 remain `NOT STARTED`.
+Phase 0 was independently reviewed and approved as `COMPLETE`. Phase 1 was completed after independent review and remediation and is now `COMPLETE`. Phase 2 was completed following independent technical review, remediation, and repository-owner approval. Phase 3 has been moved to `REVIEW`; M3D and M3E implementation work is complete and their independent review gates are pending. Phase 3 is not marked `COMPLETE`. Phases 4–12 remain `NOT STARTED`.
